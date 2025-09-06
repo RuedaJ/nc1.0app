@@ -206,17 +206,56 @@ if run:
         dem_ok = False
         S["dem_loaded"] = False
 
+    # Compute score
     w_awc=float(st.session_state["awc_weight"]); w_slp=float(st.session_state["slope_weight"]); w_lc=float(st.session_state.get("lc_weight", cfg["weights"]["water"]["landcover"]))
     score = infiltration_score(awc_da_clip, slope_da, None, w_awc, w_slp, w_lc)
     score = _ensure_like(awc_da_clip, score, name="InfiltrationScore")
-    score = score.where(np.isfinite(score), np.nan)
-    score.rio.write_nodata(np.nan, inplace=True)
 
+    # --- ensure CRS & transform before save ---
+    score = score.where(np.isfinite(score), np.nan)
+    score = score.rio.write_nodata(np.nan, inplace=False)
+    ref_crs = awc_da_clip.rio.crs
+    ref_transform = awc_da_clip.rio.transform(recalc=True)
+    score = score.rio.write_crs(ref_crs, inplace=False)
+    score = score.rio.write_transform(ref_transform, inplace=False)
+
+    # Debug captions
+    y_dim, x_dim = score.dims
+    st.caption(f"Score dims={score.dims}, sizes=({score.sizes[y_dim]}, {score.sizes[x_dim]})")
+    st.caption(f"Score CRS set? {score.rio.crs is not None}")
+    try:
+        _ = score.rio.transform(recalc=False)
+        st.caption("Score has cached transform ✅")
+    except Exception:
+        st.caption("Score transform missing; will use explicit write/fallback.")
+
+    if score.sizes[y_dim] == 0 or score.sizes[x_dim] == 0:
+        st.error("InfiltrationScore grid is empty after processing.")
+        st.stop()
+
+    # Save with rioxarray; fallback to rasterio
     out_dir = Path(cfg["paths"]["processed"]) / "hydrology"; out_dir.mkdir(parents=True, exist_ok=True)
     out_tif = out_dir / "InfiltrationScore.tif"
-    score.rio.to_raster(out_tif, compress="LZW", recalc_transform=False)
-    S["infiltration_path"]=str(out_tif)
+    try:
+        score.rio.to_raster(out_tif, compress="LZW", recalc_transform=False)
+    except Exception as e:
+        h, w = int(score.sizes[y_dim]), int(score.sizes[x_dim])
+        profile = {
+            "driver": "GTiff",
+            "height": h,
+            "width":  w,
+            "count":  1,
+            "dtype":  "float32",
+            "crs":    ref_crs,
+            "transform": ref_transform,
+            "compress": "LZW",
+            "nodata": np.nan,
+        }
+        with rio.open(out_tif, "w", **profile) as dst:
+            dst.write(score.values.astype("float32"), 1)
+        st.warning(f"Saved via rasterio fallback due to rioxarray error: {e}")
 
+    S["infiltration_path"]=str(out_tif)
     finite_ratio = float(np.isfinite(score.values).mean())
     st.caption(f"InfiltrationScore finite ratio: {finite_ratio:.3f}")
     st.success("✅ Analysis completed. Open **Mapa** to view the Infiltration layer." if dem_ok else "✅ Analysis completed (neutral slope). Open **Mapa**.")
