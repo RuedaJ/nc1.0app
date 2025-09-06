@@ -1,55 +1,197 @@
+# app/pages/01_Mapa.py
 import sys, os
-_APP_DIR = os.path.dirname(os.path.dirname(__file__))
-if _APP_DIR not in sys.path:
-    sys.path.insert(0, _APP_DIR)
-from state import get_state
+from pathlib import Path
+
+# Ensure repo root on path
+_REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import streamlit as st
-import yaml
-from pathlib import Path
+import geopandas as gpd
+import numpy as np
+import rasterio as rio
+from rasterio.enums import Resampling
+from rasterio.windows import Window
+import rioxarray as rxr
+from shapely.geometry import box
+from pyproj import Transformer
+
+# Map libs
+import folium
+from streamlit_folium import st_folium
 import leafmap.foliumap as leafmap
 
+# Fallback colorizing
+import matplotlib.cm as cm
 
-st.set_page_config(page_title="Mapa", layout="wide")
+from state import get_state
 
-cfg = yaml.safe_load(Path("configs/default.yaml").read_text())
+st.set_page_config(page_title="Mapa — sustai-geo-app", layout="wide")
 S = get_state()
 
 st.title("Mapa")
+st.caption("AOI, Infiltration layer, and click-to-inspect values.")
 
-col_map, col_layers = st.columns([4,1])
+# ---- Guards ----
+infil_path = S.get("infiltration_path")
+aoi_geojson = S.get("aoi_geojson")
+coords = S.get("coords")
 
-with col_map:
-    m = leafmap.Map(center=cfg["app"]["map_center"], zoom=6, draw_control=False, locate_control=True)
+if not infil_path or not Path(infil_path).exists():
+    st.warning("No Infiltration layer found. Run the analysis on the Home page first.")
+    st.stop()
 
-    aoi_path = S.get("aoi_geojson")
-    if aoi_path and Path(aoi_path).exists():
-        m.add_geojson(aoi_path, layer_name="AOI (buffer)")
-        try:
-            m.zoom_to_bounds(aoi_path)
-        except Exception:
-            pass
+# ---- Sidebar controls ----
+with st.sidebar:
+    st.markdown("### Layers")
+    opacity = st.slider("Infiltration opacity", 0.0, 1.0, 0.75, 0.05)
+    show_aoi = st.checkbox("Show AOI", value=True)
+    show_site = st.checkbox("Show site marker", value=True)
 
-    if S.get("coords"):
-        lat, lon = S["coords"]
-        m.add_marker(location=[lat, lon], popup="Site", draggable=False)
+# ---- Build map ----
+center = (coords[0], coords[1]) if coords else (41.65, -0.89)
+m = leafmap.Map(center=center, zoom=12, draw_control=False, measure_control=False)
 
-    infil_path = S.get("infiltration_path")
-    if infil_path and Path(infil_path).exists():
-        m.add_raster(str(infil_path), palette="Blues", layer_name="Infiltration")
+# AOI + marker
+if aoi_geojson and Path(aoi_geojson).exists():
+    try:
+        gdf = gpd.read_file(aoi_geojson)
+        if show_aoi:
+            m.add_gdf(gdf, layer_name="AOI", style={"color": "#0066CC", "weight": 2, "fill": False})
+        # Fit to AOI bounds
+        minx, miny, maxx, maxy = gdf.to_crs(4326).total_bounds
+        m.fit_bounds([[miny, minx], [maxy, maxx]])
+    except Exception as e:
+        st.warning(f"Could not render AOI: {e}")
 
-    st.write(m.to_streamlit(height=600))
+if show_site and coords:
+    folium.CircleMarker(location=[coords[0], coords[1]], radius=5,
+                        color="#DC3545", fill=True, fill_opacity=1,
+                        popup="Site").add_to(m.m)
 
-with col_layers:
-    st.subheader("Layers")
-    st.checkbox("Infiltration Score", value=bool(S.get("infiltration_path")), key="infiltration_toggle")
-    st.slider("Opacity", 0.0, 1.0, 0.7, 0.05, key="infiltration_opacity")
-    st.checkbox("Runoff Mask", value=False, key="runoff_toggle")
-    st.checkbox("Flood T=500", value=False, key="flood_toggle")
-    st.checkbox("Subcatchment", value=True, key="subcatchment_toggle")
-    st.markdown("---")
-    st.checkbox("Natura 2000", value=False, key="natura_toggle")
-    st.checkbox("Slope Classes", value=False, key="slope_class_toggle")
+# ---- Raster rendering helpers ----
+def add_raster_with_localtileserver(map_obj, tif_path: str, name: str, opacity: float):
+    """Fast path using localtileserver; requires localtileserver to be installed."""
+    map_obj.add_raster(tif_path, palette="Blues", layer_name=name, opacity=opacity, vmin=0, vmax=1)
 
-st.markdown("#### Inspector")
-st.caption("Click the map (in the final build) to see values: Infiltration, AWC, slope, land cover.")
+def add_raster_fallback_imageoverlay(map_obj, tif_path: str, name: str, opacity: float):
+    """Serverless fallback: reproject to EPSG:4326, downsample, colorize with matplotlib, add as ImageOverlay."""
+    da = rxr.open_rasterio(tif_path, masked=True).squeeze()
+    da_4326 = da.rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
+
+    # Downsample if large
+    max_px = 1024
+    h, w = da_4326.sizes[da_4326.dims[0]], da_4326.sizes[da_4326.dims[1]]
+    scale = min(1.0, max_px / max(h, w))
+    if scale < 1.0:
+        resx, resy = da_4326.rio.resolution()
+        da_4326 = da_4326.rio.reproject(
+            "EPSG:4326",
+            resolution=(abs(resx) / scale, abs(resy) / scale),
+            resampling=Resampling.bilinear,
+        )
+
+    arr = da_4326.values.astype("float32")
+    finite = np.isfinite(arr)
+    if finite.any():
+        vmin, vmax = np.nanmin(arr[finite]), np.nanmax(arr[finite])
+        if vmax > vmin:
+            arr = (arr - vmin) / (vmax - vmin)
+        else:
+            arr = np.zeros_like(arr)
+    else:
+        arr = np.zeros_like(arr)
+
+    rgba = (cm.get_cmap("Blues")(np.clip(arr, 0, 1)) * 255).astype("uint8")
+
+    south, west, north, east = da_4326.rio.bounds()
+    folium.raster_layers.ImageOverlay(
+        image=rgba,
+        bounds=[[south, west], [north, east]],
+        name=name,
+        opacity=opacity,
+        interactive=False,
+        cross_origin=False,
+        zindex=1,
+    ).add_to(map_obj.m)
+    folium.LayerControl(collapsed=False).add_to(map_obj.m)
+
+# Try fast path; else fallback
+try:
+    add_raster_with_localtileserver(m, str(infil_path), "Infiltration", opacity)
+except ImportError:
+    st.info("`localtileserver` not installed — using serverless ImageOverlay fallback.")
+    add_raster_fallback_imageoverlay(m, str(infil_path), "Infiltration", opacity)
+except Exception as e:
+    st.warning(f"Could not use local tile server ({e}). Falling back to ImageOverlay.")
+    add_raster_fallback_imageoverlay(m, str(infil_path), "Infiltration", opacity)
+
+# ---- Inspector ----
+def sample_tiff_value(tif_path: str, lon: float, lat: float):
+    try:
+        with rio.open(tif_path) as ds:
+            if ds.crs is None:
+                return None
+            transformer = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
+            x, y = transformer.transform(lon, lat)
+            val = list(ds.sample([(x, y)]))[0][0]
+            if isinstance(val, np.ndarray):
+                val = float(val[0])
+            return None if (val is None or np.isnan(val)) else float(val)
+    except Exception:
+        return None
+
+def sample_slope_from_dem(dem_path: str, lon: float, lat: float):
+    """Compute an approximate normalized slope [0,1] from a 3x3 window at click location."""
+    try:
+        with rio.open(dem_path) as ds:
+            if ds.crs is None:
+                return None
+            transformer = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
+            x, y = transformer.transform(lon, lat)
+            r, c = ds.index(x, y)
+            win = Window(col_off=max(c-1,0), row_off=max(r-1,0),
+                         width=3 if c+2 < ds.width  else min(3, ds.width - max(c-1,0)),
+                         height=3 if r+2 < ds.height else min(3, ds.height - max(r-1,0)))
+            arr = ds.read(1, window=win, boundless=True, fill_value=np.nan).astype("float32")
+            if np.isnan(arr).all():
+                return None
+            # Pixel sizes (assume no rotation for simplicity)
+            a, b, c_aff, d, e, f_aff, _, _, _ = ds.transform
+            gy, gx = np.gradient(arr)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                slope_rad = np.arctan(np.sqrt((gx * (1.0/abs(a)))**2 + (gy * (1.0/abs(e)))**2))
+            slope_deg = np.degrees(slope_rad)
+            if np.isnan(slope_deg).all():
+                return None
+            smin, smax = np.nanmin(slope_deg), np.nanmax(slope_deg)
+            if smax > smin:
+                s_norm = (smax - slope_deg) / (smax - smin + 1e-6)
+            else:
+                s_norm = np.ones_like(slope_deg)
+            return float(np.nanmean(s_norm))
+    except Exception:
+        return None
+
+# Render map and capture clicks
+st_data = st_folium(m.m, height=640, returned_objects=["last_clicked"])
+last = st_data.get("last_clicked")
+
+with st.expander("Inspector", expanded=bool(last)):
+    if last:
+        lat_click = last["lat"]; lon_click = last["lng"]
+        infil_val = sample_tiff_value(infil_path, lon_click, lat_click)
+        awc_path = S.get("awc_path")
+        awc_val = sample_tiff_value(awc_path, lon_click, lat_click) if awc_path and Path(awc_path).exists() else None
+        dem_path = S.get("dem_path")
+        slope_val = sample_slope_from_dem(dem_path, lon_click, lat_click) if dem_path and Path(dem_path).exists() else None
+
+        st.markdown(f"**Location:** {lat_click:.6f}, {lon_click:.6f}")
+        st.markdown(f"- Infiltration: **{infil_val:.3f}**" if infil_val is not None else "- Infiltration: n/a")
+        st.markdown(f"- AWC (raw): **{awc_val:.3f}**" if awc_val is not None else "- AWC (raw): n/a")
+        st.markdown(f"- Slope (norm ~[0–1]): **{slope_val:.3f}**" if slope_val is not None else "- Slope: n/a")
+    else:
+        st.write("Click on the map to inspect values at a point.")
+
+st.success("Map ready. Toggle layers and click to inspect.")
