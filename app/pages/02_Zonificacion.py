@@ -1,4 +1,10 @@
-from app.state import get_state
+import sys, os
+_APP_DIR = os.path.dirname(os.path.dirname(__file__))
+if _APP_DIR not in sys.path:
+    sys.path.insert(0, _APP_DIR)
+from state import get_state
+
+
 import streamlit as st
 
 st.set_page_config(page_title="Zonificación", layout="wide")
