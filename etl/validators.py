@@ -1,4 +1,5 @@
 import re
+from pathlib import Path
 
 def valid_lat(lat_str: str) -> bool:
     try:
@@ -25,45 +26,31 @@ def looks_like_drive_url(url: str) -> bool:
     return extract_drive_id(url) is not None
 
 def sniff_signature(path: str) -> str:
-    """Return a signature label for a file: 'TIFF', 'BIGTIFF', 'VRT', 'SQLITE',
-    'HTML', 'ZIP', 'GZIP', 'PDF', 'JSON', or 'UNKNOWN'."""
+    p = Path(path)
+    if p.is_dir():
+        return "DIR"
     try:
         with open(path, "rb") as f:
             head = f.read(2048)
         h = head.lstrip()
-        # TIFF classic
-        if head.startswith(b"II*\x00") or head.startswith(b"MM\x00*"):
-            return "TIFF"
-        # BigTIFF (0x2B)
-        if head.startswith(b"II+\x00") or head.startswith(b"MM\x00+"):
-            return "BIGTIFF"
-        # ZIP (often zipped GeoTIFF)
-        if head.startswith(b"PK\x03\x04") or head.startswith(b"PK\x05\x06") or head.startswith(b"PK\x07\x08"):
-            return "ZIP"
-        # GZIP
-        if head.startswith(b"\x1f\x8b"):
-            return "GZIP"
-        # PDF
-        if head.startswith(b"%PDF-"):
-            return "PDF"
-        # SQLite/GeoPackage
-        if head.startswith(b"SQLite format 3\x00"):
-            return "SQLITE"
-        # VRT (XML)
-        if h.startswith(b"<VRTDataset") or h.startswith(b"<?xml"):
-            return "VRT"
-        # HTML (loose)
+        if head.startswith(b"II*\x00") or head.startswith(b"MM\x00*"): return "TIFF"
+        if head.startswith(b"II+\x00") or head.startswith(b"MM\x00+"): return "BIGTIFF"
+        if head.startswith(b"PK\x03\x04") or head.startswith(b"PK\x05\x06") or head.startswith(b"PK\x07\x08"): return "ZIP"
+        if head.startswith(b"\x1f\x8b"): return "GZIP"
+        if head.startswith(b"%PDF-"): return "PDF"
+        if head.startswith(b"SQLite format 3\x00"): return "SQLITE"
+        if h.startswith(b"<VRTDataset") or h.startswith(b"<?xml"): return "VRT"
         low = head.lower()
-        if b"<html" in low or h.startswith(b"<!doctype html"):
-            return "HTML"
-        # JSON
-        if h.startswith(b"{") or h.startswith(b"["):
-            return "JSON"
+        if b"<html" in low or h.startswith(b"<!doctype html"): return "HTML"
+        if h.startswith(b"{") or h.startswith(b"["): return "JSON"
         return "UNKNOWN"
     except Exception:
         return "UNKNOWN"
 
 def validate_geotiff(path: str) -> tuple[bool, str]:
+    p = Path(path)
+    if p.is_dir():
+        return False, "Path is a directory; point to a .tif/.vrt file."
     sig = sniff_signature(path)
     if sig in ("TIFF", "BIGTIFF", "VRT"):
         try:
