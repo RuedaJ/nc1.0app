@@ -1,7 +1,7 @@
 import streamlit as st
 import yaml
 from pathlib import Path
-from app.state import get_state, reset
+from state import get_state, reset
 from etl.validators import valid_lat, valid_lon, looks_like_drive_url
 from etl.geometry import aoi_from_latlon, save_geojson
 from etl.drive import local_target_for
