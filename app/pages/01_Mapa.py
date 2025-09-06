@@ -19,7 +19,11 @@ from pyproj import Transformer
 
 # Map libs
 import folium
-from streamlit_folium import st_folium
+try:
+    from streamlit_folium import st_folium
+    HAS_STF = True
+except Exception:
+    HAS_STF = False
 import leafmap.foliumap as leafmap
 
 # Fallback colorizing
@@ -48,6 +52,9 @@ with st.sidebar:
     opacity = st.slider("Infiltration opacity", 0.0, 1.0, 0.75, 0.05)
     show_aoi = st.checkbox("Show AOI", value=True)
     show_site = st.checkbox("Show site marker", value=True)
+
+    if not HAS_STF:
+        st.info("For click-to-inspect, add `streamlit-folium` to requirements. Using fallback display.")
 
 # ---- Build map ----
 center = (coords[0], coords[1]) if coords else (41.65, -0.89)
@@ -174,24 +181,41 @@ def sample_slope_from_dem(dem_path: str, lon: float, lat: float):
     except Exception:
         return None
 
-# Render map and capture clicks
-st_data = st_folium(m.m, height=640, returned_objects=["last_clicked"])
-last = st_data.get("last_clicked")
+if HAS_STF:
+    st_data = st_folium(m.m, height=640, returned_objects=["last_clicked"])
+    last = st_data.get("last_clicked")
+    with st.expander("Inspector", expanded=bool(last)):
+        if last:
+            lat_click = last["lat"]; lon_click = last["lng"]
+            infil_val = sample_tiff_value(infil_path, lon_click, lat_click)
+            awc_path = S.get("awc_path")
+            awc_val = sample_tiff_value(awc_path, lon_click, lat_click) if awc_path and Path(awc_path).exists() else None
+            dem_path = S.get("dem_path")
+            slope_val = sample_slope_from_dem(dem_path, lon_click, lat_click) if dem_path and Path(dem_path).exists() else None
 
-with st.expander("Inspector", expanded=bool(last)):
-    if last:
-        lat_click = last["lat"]; lon_click = last["lng"]
-        infil_val = sample_tiff_value(infil_path, lon_click, lat_click)
-        awc_path = S.get("awc_path")
-        awc_val = sample_tiff_value(awc_path, lon_click, lat_click) if awc_path and Path(awc_path).exists() else None
-        dem_path = S.get("dem_path")
-        slope_val = sample_slope_from_dem(dem_path, lon_click, lat_click) if dem_path and Path(dem_path).exists() else None
+            st.markdown(f"**Location:** {lat_click:.6f}, {lon_click:.6f}")
+            st.markdown(f"- Infiltration: **{infil_val:.3f}**" if infil_val is not None else "- Infiltration: n/a")
+            st.markdown(f"- AWC (raw): **{awc_val:.3f}**" if awc_val is not None else "- AWC (raw): n/a")
+            st.markdown(f"- Slope (norm ~[0–1]): **{slope_val:.3f}**" if slope_val is not None else "- Slope: n/a")
+        else:
+            st.write("Click on the map to inspect values at a point.")
+else:
+    # Fallback display when streamlit_folium is unavailable
+    m.to_streamlit(height=640)
+    with st.expander("Inspector (fallback: manual point)"):
+        col1, col2, _ = st.columns([1,1,2])
+        with col1:
+            lat_m = st.number_input("Lat", value=float(coords[0]) if coords else 41.65, format="%.6f")
+        with col2:
+            lon_m = st.number_input("Lon", value=float(coords[1]) if coords else -0.89, format="%.6f")
+        if st.button("Sample at point"):
+            infil_val = sample_tiff_value(infil_path, lon_m, lat_m)
+            awc_path = S.get("awc_path"); dem_path = S.get("dem_path")
+            awc_val = sample_tiff_value(awc_path, lon_m, lat_m) if awc_path and Path(awc_path).exists() else None
+            slope_val = sample_slope_from_dem(dem_path, lon_m, lat_m) if dem_path and Path(dem_path).exists() else None
+            st.markdown(f"**Location:** {lat_m:.6f}, {lon_m:.6f}")
+            st.markdown(f"- Infiltration: **{infil_val:.3f}**" if infil_val is not None else "- Infiltration: n/a")
+            st.markdown(f"- AWC (raw): **{awc_val:.3f}**" if awc_val is not None else "- AWC (raw): n/a")
+            st.markdown(f"- Slope (norm ~[0–1]): **{slope_val:.3f}**" if slope_val is not None else "- Slope: n/a")
 
-        st.markdown(f"**Location:** {lat_click:.6f}, {lon_click:.6f}")
-        st.markdown(f"- Infiltration: **{infil_val:.3f}**" if infil_val is not None else "- Infiltration: n/a")
-        st.markdown(f"- AWC (raw): **{awc_val:.3f}**" if awc_val is not None else "- AWC (raw): n/a")
-        st.markdown(f"- Slope (norm ~[0–1]): **{slope_val:.3f}**" if slope_val is not None else "- Slope: n/a")
-    else:
-        st.write("Click on the map to inspect values at a point.")
-
-st.success("Map ready. Toggle layers and click to inspect.")
+st.success("Map ready. Toggle layers and inspect values.")
