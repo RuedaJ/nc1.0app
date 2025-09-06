@@ -30,9 +30,9 @@ st.sidebar.markdown("**Analysis Area**")
 radius_km = st.sidebar.slider("Analysis Radius (km)", min_value=1, max_value=cfg["app"]["max_radius_km"], value=S.get("radius_km", cfg["app"]["default_radius_km"]), key="radius_slider")
 
 st.sidebar.markdown("**Data Sources (Google Drive)**")
-awc_link = st.sidebar.text_input("AWC Raster Link *", value=S.get("awc_link") or "", key="awc_link", help="Google Drive shareable link")
-dem_link = st.sidebar.text_input("DEM (PNOA) Link *", value=S.get("dem_link") or "", key="dem_link", help="Google Drive shareable link")
-lc_link  = st.sidebar.text_input("Land Cover (optional)", value=S.get("lc_link") or "", key="lc_link")
+awc_link = st.sidebar.text_input("AWC Raster Link *", value=S.get("awc_link") or "", key="awc_link_input", help="Google Drive shareable link")
+dem_link = st.sidebar.text_input("DEM (PNOA) Link *", value=S.get("dem_link") or "", key="dem_link_input", help="Google Drive shareable link")
+lc_link  = st.sidebar.text_input("Land Cover (optional)", value=S.get("lc_link") or "", key="lc_link_input")
 
 with st.sidebar.expander("Advanced Settings"):
     st.slider("AWC Weight", 0.0, 1.0, cfg["weights"]["water"]["awc"], 0.05, key="awc_weight")
@@ -62,9 +62,11 @@ if run:
     if not valid_lat(lat) or not valid_lon(lon):
         errors.append("Invalid coordinates. Please enter valid latitude and longitude.")
     if cfg["inputs"]["require_drive_links"]:
-        if not looks_like_drive_url(awc_link):
+        _awc = st.session_state.get("awc_link_input") or ""
+        _dem = st.session_state.get("dem_link_input") or ""
+        if not looks_like_drive_url(_awc):
             errors.append("AWC: Invalid Google Drive link.")
-        if not looks_like_drive_url(dem_link):
+        if not looks_like_drive_url(_dem):
             errors.append("DEM: Invalid Google Drive link.")
     if errors:
         for e in errors:
@@ -73,9 +75,9 @@ if run:
     else:
         S["coords"] = (float(lat), float(lon))
         S["radius_km"] = int(radius_km)
-        S["awc_link"] = awc_link
-        S["dem_link"] = dem_link
-        S["lc_link"] = lc_link or None
+        S["awc_link"] = st.session_state.get("awc_link_input") or ""
+        S["dem_link"] = st.session_state.get("dem_link_input") or ""
+        S["lc_link"] = (st.session_state.get("lc_link_input") or None)
 
         aoi_gdf = aoi_from_latlon(float(lat), float(lon), float(radius_km), cfg["app"]["crs"])
         aoi_path = Path(cfg["paths"]["processed"]) / "site_aoi" / f"site_buffer_{radius_km}km.geojson"
