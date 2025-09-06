@@ -38,10 +38,14 @@ st.sidebar.markdown("**Analysis Area**")
 radius_km = st.sidebar.slider("Analysis Radius (km)", 1, cfg["app"]["max_radius_km"],
     S.get("radius_km", cfg["app"]["default_radius_km"]), key="radius_slider")
 
-st.sidebar.markdown("**Data Sources (Google Drive or local path)**")
-st.sidebar.text_input("AWC Raster *", value=S.get("awc_link") or "", key="awc_link_input")
-st.sidebar.text_input("DEM (PNOA) *", value=S.get("dem_link") or "", key="dem_link_input")
-st.sidebar.text_input("Land Cover (optional)", value=S.get("lc_link") or "", key="lc_link_input")
+st.sidebar.markdown("**Upload rasters (preferred)**")
+awc_up = st.sidebar.file_uploader("AWC GeoTIFF (*.tif, *.tiff, *.vrt)", type=["tif","tiff","vrt"], key="awc_upl")
+dem_up = st.sidebar.file_uploader("DEM GeoTIFF (*.tif, *.tiff, *.vrt)", type=["tif","tiff","vrt"], key="dem_upl")
+
+st.sidebar.markdown("**…or provide links/paths (fallback)**")
+st.sidebar.text_input("AWC Raster link or path", value=S.get("awc_link") or "", key="awc_link_input")
+st.sidebar.text_input("DEM (PNOA) link or path", value=S.get("dem_link") or "", key="dem_link_input")
+st.sidebar.text_input("Land Cover (optional link or path)", value=S.get("lc_link") or "", key="lc_link_input")
 
 with st.sidebar.expander("Advanced Settings"):
     st.slider("AWC Weight", 0.0, 1.0, cfg["weights"]["water"]["awc"], 0.05, key="awc_weight")
@@ -68,6 +72,17 @@ def _resolve_raster_file(pathlike: Path, preferred_names=(
             if cands: return cands[0]
     return p
 
+def _save_upload(upl, out: Path):
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "wb") as f:
+        f.write(upl.read())
+    return out
+
+def _reject_part(p: Path, label: str):
+    if p.suffix.lower() == ".part" or p.name.endswith(".part"):
+        st.error(f"{label} looks incomplete ({p.name}). Click '🗑️ Clear Cache' and upload again.")
+        st.stop()
+
 def _ensure_like(ref: xr.DataArray, out, name="InfiltrationScore"):
     if isinstance(out, xr.DataArray) and tuple(out.dims)==tuple(ref.dims) and all(d in out.coords for d in ref.dims):
         da = out.copy(); da.name = name
@@ -84,27 +99,23 @@ def _ensure_like(ref: xr.DataArray, out, name="InfiltrationScore"):
     return da
 
 st.title("Welcome 👋")
-st.write("Use the tabs to navigate: **Mapa**, **Zonificación**, **Dashboard**, **Informe**.")
-st.info("Enter coordinates and links/paths on the sidebar, then click **Run Analysis**.")
+st.write("Upload local rasters (recommended). You can still use links/paths as fallback.")
+st.info("After a successful run, switch to the Mapa page to see the Infiltration layer.")
 
 if run:
     errors = []
     if not valid_lat(lat) or not valid_lon(lon):
         errors.append("Invalid coordinates. Please enter valid latitude and longitude.")
-    _awc = st.session_state.get("awc_link_input") or ""
-    _dem = st.session_state.get("dem_link_input") or ""
-    _lc  = st.session_state.get("lc_link_input") or ""
+    _awc_link = st.session_state.get("awc_link_input") or ""
+    _dem_link = st.session_state.get("dem_link_input") or ""
+    _lc_link  = st.session_state.get("lc_link_input") or ""
 
-    if cfg["inputs"]["require_drive_links"]:
-        from pathlib import Path as _P
-        if not (_P(_awc).exists() or looks_like_drive_url(_awc)): errors.append("AWC: Invalid path/link.")
-        if not (_P(_dem).exists() or looks_like_drive_url(_dem)): errors.append("DEM: Invalid path/link.")
     if errors:
         for e in errors: st.error(e); S["errors"]=errors
         st.stop()
 
     S["coords"]=(float(lat), float(lon)); S["radius_km"]=int(radius_km)
-    S["awc_link"]=_awc; S["dem_link"]=_dem; S["lc_link"]=(_lc or None)
+    S["awc_link"]=_awc_link; S["dem_link"]=_dem_link; S["lc_link"]=(_lc_link or None)
 
     # AOI
     aoi_gdf = aoi_from_latlon(float(lat), float(lon), float(radius_km), cfg["app"]["crs"])
@@ -114,23 +125,35 @@ if run:
 
     raw_dir = Path(cfg["paths"]["raw"])
 
-    # AWC
-    if Path(_awc).exists():
-        awc_raw = Path(_awc)
-    elif parse_drive_url(_awc)[0] in ("file","folder"):
-        awc_raw = download_drive_any(_awc, raw_dir/"awc")
+    # AWC: prefer local upload, then link/path fallback
+    if awc_up is not None:
+        awc_raw = _save_upload(awc_up, raw_dir/"awc"/"awc.tif")
     else:
-        awc_raw = download_to(raw_dir/"awc"/"awc.tif", _awc)
+        if Path(_awc_link).exists():
+            awc_raw = Path(_awc_link)
+        elif parse_drive_url(_awc_link)[0] in ("file","folder"):
+            awc_raw = download_drive_any(_awc_link, raw_dir/"awc")
+        elif _awc_link:
+            awc_raw = download_to(raw_dir/"awc"/"awc.tif", _awc_link)
+        else:
+            st.error("Please upload AWC or provide a link/path."); st.stop()
     awc_raw = _resolve_raster_file(awc_raw)
+    _reject_part(awc_raw, "AWC")
 
-    # DEM
-    if Path(_dem).exists():
-        dem_raw = Path(_dem)
-    elif parse_drive_url(_dem)[0] in ("file","folder"):
-        dem_raw = download_drive_any(_dem, raw_dir/"dem")
+    # DEM: prefer local upload, then link/path fallback
+    if dem_up is not None:
+        dem_raw = _save_upload(dem_up, raw_dir/"dem"/"dem.tif")
     else:
-        dem_raw = download_to(raw_dir/"dem"/"dem.tif", _dem)
+        if Path(_dem_link).exists():
+            dem_raw = Path(_dem_link)
+        elif parse_drive_url(_dem_link)[0] in ("file","folder"):
+            dem_raw = download_drive_any(_dem_link, raw_dir/"dem")
+        elif _dem_link:
+            dem_raw = download_to(raw_dir/"dem"/"dem.tif", _dem_link)
+        else:
+            st.error("Please upload DEM or provide a link/path."); st.stop()
     dem_raw = _resolve_raster_file(dem_raw)
+    _reject_part(dem_raw, "DEM")
 
     # Diagnostics: signatures
     awc_sig = sniff_signature(str(awc_raw)) if awc_raw.exists() and awc_raw.is_file() else ("DIR" if awc_raw.exists() and awc_raw.is_dir() else "MISSING")
@@ -188,10 +211,6 @@ if run:
     score = _ensure_like(awc_da_clip, score, name="InfiltrationScore")
     score = score.where(np.isfinite(score), np.nan)
     score.rio.write_nodata(np.nan, inplace=True)
-
-    # Guard & save with stable transform
-    if any(len(score.coords[d]) == 0 for d in score.dims):
-        st.error("InfiltrationScore has empty spatial coordinates; likely due to non-overlapping inputs or lost transform."); st.stop()
 
     out_dir = Path(cfg["paths"]["processed"]) / "hydrology"; out_dir.mkdir(parents=True, exist_ok=True)
     out_tif = out_dir / "InfiltrationScore.tif"
