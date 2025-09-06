@@ -1,6 +1,6 @@
 import os, re, requests, time, shutil
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple
 
 try:
     import gdown  # robust Google Drive downloader
@@ -12,8 +12,9 @@ FILE_RE   = re.compile(r"/file/d/([A-Za-z0-9_-]{20,})")
 ID_RE     = re.compile(r"[?&]id=([A-Za-z0-9_-]{20,})")
 FOLDER_RE = re.compile(r"/folders/([A-Za-z0-9_-]{20,})")
 
-RASTER_EXTS = (".tif", ".tiff", ".vrt", ".img")
+RASTER_EXTS = (".tif", ".tiff", ".vrt", ".img")  # extend as needed
 
+# ---------------- Core parsing ----------------
 def parse_drive_url(url: str) -> Tuple[Optional[str], Optional[str]]:
     """Return (kind, id) where kind in {'file','folder'} or (None,None)."""
     if not url:
@@ -34,6 +35,7 @@ def is_drive_url(url: str) -> bool:
     k, i = parse_drive_url(url or "")
     return k is not None and i is not None
 
+# ---------------- Local caching helpers ----------------
 def local_target_for(url: str, base_dir: Path, suggested_name: str | None = None) -> Path:
     base_dir.mkdir(parents=True, exist_ok=True)
     kind, fid = parse_drive_url(url or "")
@@ -55,9 +57,18 @@ def _download_via_requests(path: Path, url: str, chunk=2**20) -> Path:
                     f.write(b)
     return path
 
-def _find_first_raster_in_dir(d: Path, exts=RASTER_EXTS) -> Optional[Path]:
+def download_to(path: Path, url: str, chunk=2**20) -> Path:
+    if not url:
+        raise ValueError("Empty URL for download.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return _download_via_requests(path, url, chunk=chunk)
+
+# ---------------- Folder-aware Drive download ----------------
+def _find_first_raster_in_dir(d: Path, exts=RASTER_EXTS) -> Path | None:
+    if not d.exists() or not d.is_dir():
+        return None
     for ext in exts:
-        cands = sorted(d.glob(f"*{ext}"))
+        cands = sorted(d.rglob(f"*{ext}"))  # search recursively for nested files
         if cands:
             return cands[0]
     return None
@@ -74,7 +85,7 @@ def _cleanup_parts(d: Path) -> None:
 def download_drive_any(url: str, dest_dir: Path, prefer_exts=RASTER_EXTS) -> Path:
     """Download a Google Drive file or folder; return a concrete raster file path.
     - For *folder* links: downloads folder into dest_dir, returns first raster file.
-    - For *file* links: downloads into dest_dir, returns the file path.
+    - For *file* links: downloads into dest_dir, returns the file path (or the first raster found).
     """
     if gdown is None:
         raise RuntimeError("gdown is not installed; cannot download Google Drive files.")
@@ -90,45 +101,36 @@ def download_drive_any(url: str, dest_dir: Path, prefer_exts=RASTER_EXTS) -> Pat
         out = gdown.download_folder(id=fid, output=str(dest_dir), quiet=True, use_cookies=False)
         if not out:
             raise RuntimeError("gdown.download_folder returned no files. Check sharing permissions.")
-        # 'out' is a list of file paths (strings). Pick first raster.
-        ras = None
-        for p in out:
-            pp = Path(p)
-            if pp.suffix.lower() in prefer_exts:
-                ras = pp
-                break
-        if ras is None:
-            # Maybe nested dirs; search within dest_dir
-            ras = _find_first_raster_in_dir(dest_dir, prefer_exts)
+        # try to find a raster inside the downloaded folder tree
+        ras = _find_first_raster_in_dir(dest_dir, prefer_exts)
         if ras is None:
             raise RuntimeError("Downloaded folder contains no .tif/.tiff/.vrt/.img. Place a raster in the folder or link directly to the file.")
         return ras
 
-    # file
+    # kind == "file"
     out = gdown.download(id=fid, output=str(dest_dir), quiet=True, fuzzy=True, use_cookies=False)
     if out is None:
-        # Sometimes gdown returns None on permission issues or quota
         raise RuntimeError("gdown failed to download the Drive file. Check that sharing is 'Anyone with the link'.")
     outp = Path(out)
     if outp.is_dir():
-        # Rare case: returns a dir; try find a raster inside
         cand = _find_first_raster_in_dir(outp, prefer_exts) or _find_first_raster_in_dir(dest_dir, prefer_exts)
         if cand:
             return cand
     if outp.suffix.lower() in prefer_exts and outp.exists():
         return outp
 
-    # If a generic file (e.g., .zip) was downloaded, try to find a raster in dest_dir
     cand = _find_first_raster_in_dir(dest_dir, prefer_exts)
     if cand:
         return cand
 
-    # Last resort: error with hint
     raise RuntimeError(f"Downloaded file is not a raster: {outp.name}. Provide a direct .tif link or a Drive *folder* containing the .tif.")
 
-def download_to(path: Path, url: str, chunk=2**20) -> Path:
-    """Download a non-Drive URL to a specific path (HTTP)."""
-    if not url:
-        raise ValueError("Empty URL for download.")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return _download_via_requests(path, url, chunk=chunk)
+# ---------------- Backward-compat shims ----------------
+def extract_id(url: str) -> str | None:
+    """Legacy: return Drive file/folder id (prefers whichever is present)."""
+    _, fid = parse_drive_url(url or "")
+    return fid
+
+def download_drive_file(url: str, dest_dir: Path) -> Path:
+    """Legacy: behave like the old function by delegating to folder-aware downloader."""
+    return download_drive_any(url, dest_dir)
