@@ -16,6 +16,7 @@ weasyprint>=62.0
 gdown>=5.1.0
 leafmap>=0.32.0
 streamlit-folium>=0.18.0
+Pillow
 
 # optional for faster tiled rendering:
 localtileserver>=0.7.4
