@@ -24,10 +24,10 @@ try:
     HAS_STF = True
 except Exception:
     HAS_STF = False
-import leafmap.foliumap as leafmap
 
-# Fallback colorizing
-import matplotlib.cm as cm
+# We still use leafmap for its helpers/visual convenience on the fallback path
+import leafmap.foliumap as leafmap
+import matplotlib.cm as cm  # for ImageOverlay colorizing
 
 from state import get_state
 
@@ -52,37 +52,43 @@ with st.sidebar:
     opacity = st.slider("Infiltration opacity", 0.0, 1.0, 0.75, 0.05)
     show_aoi = st.checkbox("Show AOI", value=True)
     show_site = st.checkbox("Show site marker", value=True)
-
     if not HAS_STF:
         st.info("For click-to-inspect, add `streamlit-folium` to requirements. Using fallback display.")
 
-# ---- Build map ----
-center = (coords[0], coords[1]) if coords else (41.65, -0.89)
-m = leafmap.Map(center=center, zoom=12, draw_control=False, measure_control=False)
-
-# AOI + marker
-if aoi_geojson and Path(aoi_geojson).exists():
+# ---------- Shared helpers ----------
+def add_aoi_to_folium_map(fm: folium.Map, aoi_path: str):
     try:
-        gdf = gpd.read_file(aoi_geojson)
-        if show_aoi:
-            m.add_gdf(gdf, layer_name="AOI", style={"color": "#0066CC", "weight": 2, "fill": False})
+        gdf = gpd.read_file(aoi_path)
+        gj = folium.GeoJson(gdf.to_crs(4326).__geo_interface__,
+                            name="AOI",
+                            style_function=lambda _:
+                                {"color": "#0066CC", "weight": 2, "fill": False})
+        gj.add_to(fm)
         # Fit to AOI bounds
         minx, miny, maxx, maxy = gdf.to_crs(4326).total_bounds
-        m.fit_bounds([[miny, minx], [maxy, maxx]])
+        fm.fit_bounds([[miny, minx], [maxy, maxx]])
     except Exception as e:
         st.warning(f"Could not render AOI: {e}")
 
-if show_site and coords:
-    folium.CircleMarker(location=[coords[0], coords[1]], radius=5,
+def add_site_marker_to_folium_map(fm: folium.Map, lat: float, lon: float):
+    folium.CircleMarker(location=[lat, lon], radius=5,
                         color="#DC3545", fill=True, fill_opacity=1,
-                        popup="Site").add_to(m.m)
+                        popup="Site").add_to(fm)
 
-# ---- Raster rendering helpers ----
-def add_raster_with_localtileserver(map_obj, tif_path: str, name: str, opacity: float):
-    """Fast path using localtileserver; requires localtileserver to be installed."""
-    map_obj.add_raster(tif_path, palette="Blues", layer_name=name, opacity=opacity, vmin=0, vmax=1)
+def add_raster_tiles_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: float):
+    """Use localtileserver via leafmap.common if available; else raise ImportError."""
+    from leafmap.common import get_local_tile_layer  # may raise ImportError
+    tile_layer, _client = get_local_tile_layer(
+        tif_path,
+        name=name,
+        palette="Blues",
+        vmin=0, vmax=1,
+        opacity=opacity,
+    )
+    tile_layer.add_to(fm)
+    folium.LayerControl(collapsed=False).add_to(fm)
 
-def add_raster_fallback_imageoverlay(map_obj, tif_path: str, name: str, opacity: float):
+def add_raster_imageoverlay_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: float):
     """Serverless fallback: reproject to EPSG:4326, downsample, colorize with matplotlib, add as ImageOverlay."""
     da = rxr.open_rasterio(tif_path, masked=True).squeeze()
     da_4326 = da.rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
@@ -111,7 +117,6 @@ def add_raster_fallback_imageoverlay(map_obj, tif_path: str, name: str, opacity:
         arr = np.zeros_like(arr)
 
     rgba = (cm.get_cmap("Blues")(np.clip(arr, 0, 1)) * 255).astype("uint8")
-
     south, west, north, east = da_4326.rio.bounds()
     folium.raster_layers.ImageOverlay(
         image=rgba,
@@ -121,20 +126,9 @@ def add_raster_fallback_imageoverlay(map_obj, tif_path: str, name: str, opacity:
         interactive=False,
         cross_origin=False,
         zindex=1,
-    ).add_to(map_obj.m)
-    folium.LayerControl(collapsed=False).add_to(map_obj.m)
+    ).add_to(fm)
+    folium.LayerControl(collapsed=False).add_to(fm)
 
-# Try fast path; else fallback
-try:
-    add_raster_with_localtileserver(m, str(infil_path), "Infiltration", opacity)
-except ImportError:
-    st.info("`localtileserver` not installed — using serverless ImageOverlay fallback.")
-    add_raster_fallback_imageoverlay(m, str(infil_path), "Infiltration", opacity)
-except Exception as e:
-    st.warning(f"Could not use local tile server ({e}). Falling back to ImageOverlay.")
-    add_raster_fallback_imageoverlay(m, str(infil_path), "Infiltration", opacity)
-
-# ---- Inspector ----
 def sample_tiff_value(tif_path: str, lon: float, lat: float):
     try:
         with rio.open(tif_path) as ds:
@@ -150,7 +144,7 @@ def sample_tiff_value(tif_path: str, lon: float, lat: float):
         return None
 
 def sample_slope_from_dem(dem_path: str, lon: float, lat: float):
-    """Compute an approximate normalized slope [0,1] from a 3x3 window at click location."""
+    """Approximate normalized slope [0,1] from a 3x3 window at click location."""
     try:
         with rio.open(dem_path) as ds:
             if ds.crs is None:
@@ -164,7 +158,6 @@ def sample_slope_from_dem(dem_path: str, lon: float, lat: float):
             arr = ds.read(1, window=win, boundless=True, fill_value=np.nan).astype("float32")
             if np.isnan(arr).all():
                 return None
-            # Pixel sizes (assume no rotation for simplicity)
             a, b, c_aff, d, e, f_aff, _, _, _ = ds.transform
             gy, gx = np.gradient(arr)
             with np.errstate(invalid="ignore", divide="ignore"):
@@ -181,8 +174,27 @@ def sample_slope_from_dem(dem_path: str, lon: float, lat: float):
     except Exception:
         return None
 
+# ---------- Render ----------
 if HAS_STF:
-    st_data = st_folium(m.m, height=640, returned_objects=["last_clicked"])
+    # Build a pure folium map so click events work
+    base_loc = (coords[0], coords[1]) if coords else (41.65, -0.89)
+    fm = folium.Map(location=base_loc, zoom_start=12, control_scale=True, tiles="CartoDB positron")
+
+    # AOI and site
+    if aoi_geojson and Path(aoi_geojson).exists() and show_aoi:
+        add_aoi_to_folium_map(fm, aoi_geojson)
+    if show_site and coords:
+        add_site_marker_to_folium_map(fm, coords[0], coords[1])
+
+    # Raster layer
+    try:
+        add_raster_tiles_to_folium(fm, str(infil_path), "Infiltration", opacity)
+    except Exception as e:
+        st.info(f"`localtileserver` path unavailable ({e}). Using ImageOverlay fallback.")
+        add_raster_imageoverlay_to_folium(fm, str(infil_path), "Infiltration", opacity)
+
+    # Show + click inspector
+    st_data = st_folium(fm, height=640, returned_objects=["last_clicked"])
     last = st_data.get("last_clicked")
     with st.expander("Inspector", expanded=bool(last)):
         if last:
@@ -200,8 +212,67 @@ if HAS_STF:
         else:
             st.write("Click on the map to inspect values at a point.")
 else:
-    # Fallback display when streamlit_folium is unavailable
+    # Fallback display without streamlit_folium: use leafmap and manual sampler
+    base_loc = (coords[0], coords[1]) if coords else (41.65, -0.89)
+    m = leafmap.Map(center=base_loc, zoom=12, draw_control=False, measure_control=False)
+
+    # AOI and site
+    if aoi_geojson and Path(aoi_geojson).exists() and show_aoi:
+        try:
+            gdf = gpd.read_file(aoi_geojson)
+            m.add_gdf(gdf, layer_name="AOI", style={"color": "#0066CC", "weight": 2, "fill": False})
+            minx, miny, maxx, maxy = gdf.to_crs(4326).total_bounds
+            m.fit_bounds([[miny, minx], [maxy, maxx]])
+        except Exception as e:
+            st.warning(f"Could not render AOI: {e}")
+    if show_site and coords:
+        # leafmap convenience
+        m.add_marker(location=(coords[0], coords[1]), popup="Site")
+
+    # Raster layer (ImageOverlay fallback)
+    try:
+        # Try tiling via localtileserver on leafmap (if installed)
+        m.add_raster(str(infil_path), palette="Blues", layer_name="Infiltration", opacity=opacity, vmin=0, vmax=1)
+    except Exception:
+        # Fallback: ImageOverlay style (use folium layer added via add_layer)
+        da = rxr.open_rasterio(str(infil_path), masked=True).squeeze()
+        da_4326 = da.rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
+        max_px = 1024
+        h, w = da_4326.sizes[da_4326.dims[0]], da_4326.sizes[da_4326.dims[1]]
+        scale = min(1.0, max_px / max(h, w))
+        if scale < 1.0:
+            resx, resy = da_4326.rio.resolution()
+            da_4326 = da_4326.rio.reproject(
+                "EPSG:4326",
+                resolution=(abs(resx) / scale, abs(resy) / scale),
+                resampling=Resampling.bilinear,
+            )
+        arr = da_4326.values.astype("float32")
+        finite = np.isfinite(arr)
+        if finite.any():
+            vmin, vmax = np.nanmin(arr[finite]), np.nanmax(arr[finite])
+            if vmax > vmin:
+                arr = (arr - vmin) / (vmax - vmin)
+            else:
+                arr = np.zeros_like(arr)
+        else:
+            arr = np.zeros_like(arr)
+        rgba = (cm.get_cmap("Blues")(np.clip(arr, 0, 1)) * 255).astype("uint8")
+        south, west, north, east = da_4326.rio.bounds()
+        overlay = folium.raster_layers.ImageOverlay(
+            image=rgba,
+            bounds=[[south, west], [north, east]],
+            name="Infiltration",
+            opacity=opacity,
+            interactive=False,
+            cross_origin=False,
+            zindex=1,
+        )
+        m.add_layer(overlay)
+
     m.to_streamlit(height=640)
+
+    # Manual inspector
     with st.expander("Inspector (fallback: manual point)"):
         col1, col2, _ = st.columns([1,1,2])
         with col1:
