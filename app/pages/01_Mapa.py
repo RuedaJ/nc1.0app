@@ -25,9 +25,18 @@ try:
 except Exception:
     HAS_STF = False
 
-# We still use leafmap for its helpers/visual convenience on the fallback path
-import leafmap.foliumap as leafmap
-import matplotlib.cm as cm  # for ImageOverlay colorizing
+# Optional fast tiling
+try:
+    from leafmap.common import get_local_tile_layer
+    HAS_LTS = True
+except Exception:
+    HAS_LTS = False
+
+# Fallback colorizing / image embed
+import matplotlib.cm as cm
+from PIL import Image
+import base64
+import io
 
 from state import get_state
 
@@ -59,10 +68,12 @@ with st.sidebar:
 def add_aoi_to_folium_map(fm: folium.Map, aoi_path: str):
     try:
         gdf = gpd.read_file(aoi_path)
-        gj = folium.GeoJson(gdf.to_crs(4326).__geo_interface__,
-                            name="AOI",
-                            style_function=lambda _:
-                                {"color": "#0066CC", "weight": 2, "fill": False})
+        gj = folium.GeoJson(
+            gdf.to_crs(4326).__geo_interface__,
+            name="AOI",
+            style_function=lambda _:
+                {"color": "#0066CC", "weight": 2, "fill": False},
+        )
         gj.add_to(fm)
         # Fit to AOI bounds
         minx, miny, maxx, maxy = gdf.to_crs(4326).total_bounds
@@ -71,29 +82,45 @@ def add_aoi_to_folium_map(fm: folium.Map, aoi_path: str):
         st.warning(f"Could not render AOI: {e}")
 
 def add_site_marker_to_folium_map(fm: folium.Map, lat: float, lon: float):
-    folium.CircleMarker(location=[lat, lon], radius=5,
-                        color="#DC3545", fill=True, fill_opacity=1,
-                        popup="Site").add_to(fm)
+    folium.CircleMarker(
+        location=[lat, lon],
+        radius=5,
+        color="#DC3545",
+        fill=True,
+        fill_opacity=1,
+        popup="Site",
+    ).add_to(fm)
 
-def add_raster_tiles_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: float):
-    """Use localtileserver via leafmap.common if available; else raise ImportError."""
-    from leafmap.common import get_local_tile_layer  # may raise ImportError
-    tile_layer, _client = get_local_tile_layer(
-        tif_path,
-        name=name,
-        palette="Blues",
-        vmin=0, vmax=1,
-        opacity=opacity,
-    )
-    tile_layer.add_to(fm)
-    folium.LayerControl(collapsed=False).add_to(fm)
+def _rgba_data_uri(rgba: np.ndarray) -> str:
+    """Encode RGBA uint8 image to data URI PNG so Folium can always render it."""
+    im = Image.fromarray(rgba, mode="RGBA")
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{b64}"
 
-def add_raster_imageoverlay_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: float):
-    """Serverless fallback: reproject to EPSG:4326, downsample, colorize with matplotlib, add as ImageOverlay."""
+def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: float):
+    """Try local tiles; else embed PNG as base64 ImageOverlay."""
+    if HAS_LTS:
+        try:
+            tile_layer, _client = get_local_tile_layer(
+                tif_path,
+                name=name,
+                palette="Blues",
+                vmin=0, vmax=1,
+                opacity=opacity,
+            )
+            tile_layer.add_to(fm)
+            folium.LayerControl(collapsed=False).add_to(fm)
+            return
+        except Exception as e:
+            st.info(f"`localtileserver` path unavailable ({e}). Using ImageOverlay fallback.")
+
+    # Fallback: reproject to EPSG:4326 → normalize → colorize → embed as data URI
     da = rxr.open_rasterio(tif_path, masked=True).squeeze()
     da_4326 = da.rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
 
-    # Downsample if large
+    # Downsample if large to keep frontend fast
     max_px = 1024
     h, w = da_4326.sizes[da_4326.dims[0]], da_4326.sizes[da_4326.dims[1]]
     scale = min(1.0, max_px / max(h, w))
@@ -107,25 +134,32 @@ def add_raster_imageoverlay_to_folium(fm: folium.Map, tif_path: str, name: str, 
 
     arr = da_4326.values.astype("float32")
     finite = np.isfinite(arr)
+    # Display stats to debug flat/NaN rasters
     if finite.any():
-        vmin, vmax = np.nanmin(arr[finite]), np.nanmax(arr[finite])
+        vmin, vmax = float(np.nanmin(arr[finite])), float(np.nanmax(arr[finite]))
+        st.caption(f"Infiltration stats (display): min={vmin:.4f}, max={vmax:.4f}, finite%={100*np.mean(finite):.1f}")
         if vmax > vmin:
             arr = (arr - vmin) / (vmax - vmin)
         else:
             arr = np.zeros_like(arr)
     else:
+        st.caption("Infiltration display: no finite values; rendering blank.")
         arr = np.zeros_like(arr)
 
     rgba = (cm.get_cmap("Blues")(np.clip(arr, 0, 1)) * 255).astype("uint8")
+    # Apply overall opacity via alpha channel
+    if 0.0 <= opacity < 1.0:
+        rgba[..., 3] = (rgba[..., 3].astype("float32") * opacity).astype("uint8")
+
     south, west, north, east = da_4326.rio.bounds()
     folium.raster_layers.ImageOverlay(
-        image=rgba,
+        image=_rgba_data_uri(rgba),
         bounds=[[south, west], [north, east]],
         name=name,
-        opacity=opacity,
+        opacity=1.0,  # keep 1.0; we already applied alpha to pixels
         interactive=False,
         cross_origin=False,
-        zindex=1,
+        zindex=500,
     ).add_to(fm)
     folium.LayerControl(collapsed=False).add_to(fm)
 
@@ -152,16 +186,19 @@ def sample_slope_from_dem(dem_path: str, lon: float, lat: float):
             transformer = Transformer.from_crs("EPSG:4326", ds.crs, always_xy=True)
             x, y = transformer.transform(lon, lat)
             r, c = ds.index(x, y)
-            win = Window(col_off=max(c-1,0), row_off=max(r-1,0),
-                         width=3 if c+2 < ds.width  else min(3, ds.width - max(c-1,0)),
-                         height=3 if r+2 < ds.height else min(3, ds.height - max(r-1,0)))
+            win = Window(
+                col_off=max(c - 1, 0),
+                row_off=max(r - 1, 0),
+                width=3 if c + 2 < ds.width else min(3, ds.width - max(c - 1, 0)),
+                height=3 if r + 2 < ds.height else min(3, ds.height - max(r - 1, 0)),
+            )
             arr = ds.read(1, window=win, boundless=True, fill_value=np.nan).astype("float32")
             if np.isnan(arr).all():
                 return None
             a, b, c_aff, d, e, f_aff, _, _, _ = ds.transform
             gy, gx = np.gradient(arr)
             with np.errstate(invalid="ignore", divide="ignore"):
-                slope_rad = np.arctan(np.sqrt((gx * (1.0/abs(a)))**2 + (gy * (1.0/abs(e)))**2))
+                slope_rad = np.arctan(np.sqrt((gx * (1.0 / abs(a))) ** 2 + (gy * (1.0 / abs(e))) ** 2))
             slope_deg = np.degrees(slope_rad)
             if np.isnan(slope_deg).all():
                 return None
@@ -175,25 +212,19 @@ def sample_slope_from_dem(dem_path: str, lon: float, lat: float):
         return None
 
 # ---------- Render ----------
+base_loc = (coords[0], coords[1]) if coords else (41.65, -0.89)
+fm = folium.Map(location=base_loc, zoom_start=12, control_scale=True, tiles="CartoDB positron")
+
+# AOI and site
+if aoi_geojson and Path(aoi_geojson).exists() and show_aoi:
+    add_aoi_to_folium_map(fm, aoi_geojson)
+if show_site and coords:
+    add_site_marker_to_folium_map(fm, coords[0], coords[1])
+
+# Raster layer (tiles if possible; otherwise embedded PNG overlay guaranteed to render)
+add_raster_to_folium(fm, str(infil_path), "Infiltration", opacity)
+
 if HAS_STF:
-    # Build a pure folium map so click events work
-    base_loc = (coords[0], coords[1]) if coords else (41.65, -0.89)
-    fm = folium.Map(location=base_loc, zoom_start=12, control_scale=True, tiles="CartoDB positron")
-
-    # AOI and site
-    if aoi_geojson and Path(aoi_geojson).exists() and show_aoi:
-        add_aoi_to_folium_map(fm, aoi_geojson)
-    if show_site and coords:
-        add_site_marker_to_folium_map(fm, coords[0], coords[1])
-
-    # Raster layer
-    try:
-        add_raster_tiles_to_folium(fm, str(infil_path), "Infiltration", opacity)
-    except Exception as e:
-        st.info(f"`localtileserver` path unavailable ({e}). Using ImageOverlay fallback.")
-        add_raster_imageoverlay_to_folium(fm, str(infil_path), "Infiltration", opacity)
-
-    # Show + click inspector
     st_data = st_folium(fm, height=640, returned_objects=["last_clicked"])
     last = st_data.get("last_clicked")
     with st.expander("Inspector", expanded=bool(last)):
@@ -212,69 +243,14 @@ if HAS_STF:
         else:
             st.write("Click on the map to inspect values at a point.")
 else:
-    # Fallback display without streamlit_folium: use leafmap and manual sampler
-    base_loc = (coords[0], coords[1]) if coords else (41.65, -0.89)
-    m = leafmap.Map(center=base_loc, zoom=12, draw_control=False, measure_control=False)
+    # If streamlit-folium is missing, render a static map snapshot and manual sampler
+    st.info("Install `streamlit-folium` for click inspector. Showing map and manual sampler.")
+    html_path = Path("data/processed/_tmp_map.html"); html_path.parent.mkdir(parents=True, exist_ok=True)
+    fm.save(str(html_path))
+    st.components.v1.iframe(src=str(html_path), height=640)
 
-    # AOI and site
-    if aoi_geojson and Path(aoi_geojson).exists() and show_aoi:
-        try:
-            gdf = gpd.read_file(aoi_geojson)
-            m.add_gdf(gdf, layer_name="AOI", style={"color": "#0066CC", "weight": 2, "fill": False})
-            minx, miny, maxx, maxy = gdf.to_crs(4326).total_bounds
-            m.fit_bounds([[miny, minx], [maxy, maxx]])
-        except Exception as e:
-            st.warning(f"Could not render AOI: {e}")
-    if show_site and coords:
-        # leafmap convenience
-        m.add_marker(location=(coords[0], coords[1]), popup="Site")
-
-    # Raster layer (ImageOverlay fallback)
-    try:
-        # Try tiling via localtileserver on leafmap (if installed)
-        m.add_raster(str(infil_path), palette="Blues", layer_name="Infiltration", opacity=opacity, vmin=0, vmax=1)
-    except Exception:
-        # Fallback: ImageOverlay style (use folium layer added via add_layer)
-        da = rxr.open_rasterio(str(infil_path), masked=True).squeeze()
-        da_4326 = da.rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
-        max_px = 1024
-        h, w = da_4326.sizes[da_4326.dims[0]], da_4326.sizes[da_4326.dims[1]]
-        scale = min(1.0, max_px / max(h, w))
-        if scale < 1.0:
-            resx, resy = da_4326.rio.resolution()
-            da_4326 = da_4326.rio.reproject(
-                "EPSG:4326",
-                resolution=(abs(resx) / scale, abs(resy) / scale),
-                resampling=Resampling.bilinear,
-            )
-        arr = da_4326.values.astype("float32")
-        finite = np.isfinite(arr)
-        if finite.any():
-            vmin, vmax = np.nanmin(arr[finite]), np.nanmax(arr[finite])
-            if vmax > vmin:
-                arr = (arr - vmin) / (vmax - vmin)
-            else:
-                arr = np.zeros_like(arr)
-        else:
-            arr = np.zeros_like(arr)
-        rgba = (cm.get_cmap("Blues")(np.clip(arr, 0, 1)) * 255).astype("uint8")
-        south, west, north, east = da_4326.rio.bounds()
-        overlay = folium.raster_layers.ImageOverlay(
-            image=rgba,
-            bounds=[[south, west], [north, east]],
-            name="Infiltration",
-            opacity=opacity,
-            interactive=False,
-            cross_origin=False,
-            zindex=1,
-        )
-        m.add_layer(overlay)
-
-    m.to_streamlit(height=640)
-
-    # Manual inspector
     with st.expander("Inspector (fallback: manual point)"):
-        col1, col2, _ = st.columns([1,1,2])
+        col1, col2, _ = st.columns([1, 1, 2])
         with col1:
             lat_m = st.number_input("Lat", value=float(coords[0]) if coords else 41.65, format="%.6f")
         with col2:
@@ -289,4 +265,4 @@ else:
             st.markdown(f"- AWC (raw): **{awc_val:.3f}**" if awc_val is not None else "- AWC (raw): n/a")
             st.markdown(f"- Slope (norm ~[0–1]): **{slope_val:.3f}**" if slope_val is not None else "- Slope: n/a")
 
-st.success("Map ready. Toggle layers and inspect values.")
+st.success("Map ready. Adjust opacity, toggle AOI, and inspect values.")
