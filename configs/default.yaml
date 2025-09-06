@@ -1,1 +1,44 @@
+app:
+  title: "sustai-geo-app"
+  language_default: "EN"
+  crs: "EPSG:25830"
+  map_center: [40.4168, -3.7038]
+  default_radius_km: 5
+  max_radius_km: 20
 
+inputs:
+  require_drive_links: true
+  drive_help_url: "https://support.google.com/drive/answer/2494822"
+
+weights:
+  water:
+    awc: 0.35
+    slope: 0.35
+    landcover: 0.30
+
+api:
+  mapa_base: "https://wmts.mapama.gob.es/sig-api/ogc/features/v1"
+  collections:
+    flood_zfp: "agua:ZI_Laminas_ZFP"
+    flood_t500: "agua:Zi_laminas_q500"
+    red_natura: "biodiversidad:RedNatura"
+  crs: "EPSG:25830"
+
+analysis:
+  priority_classification: "natural_breaks" # or 'quantiles'
+  exclusions:
+    floodplains: true
+    protected_areas: false
+
+cache:
+  drive_ttl_hours: 24
+  allow_reuse_if_exists: true
+
+limits:
+  max_download_mb: 2048
+
+paths:
+  raw: "data/raw"
+  interim: "data/interim"
+  processed: "data/processed"
+  reports: "data/reports"
