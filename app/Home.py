@@ -129,23 +129,25 @@ if run:
 
     raw_dir = Path(cfg["paths"]["raw"])
 
-    # AWC resolve/download
+    # AWC
+    from etl.drive import download_drive_any, parse_drive_url
     if Path(_awc).exists():
         awc_raw = Path(_awc)
-    elif extract_id(_awc):
-        awc_raw = download_drive_file(_awc, raw_dir/"awc")
+    elif parse_drive_url(_awc)[0] in ("file","folder"):
+        awc_raw = download_drive_any(_awc, raw_dir/"awc")
     else:
         awc_raw = download_to(raw_dir/"awc"/"awc.tif", _awc)
     awc_raw = _resolve_raster_file(awc_raw, ("awc.tif","AWC.tif","awc.vrt"))
 
-    # DEM resolve/download
+    # DEM
     if Path(_dem).exists():
         dem_raw = Path(_dem)
-    elif extract_id(_dem):
-        dem_raw = download_drive_file(_dem, raw_dir/"dem")
+    elif parse_drive_url(_dem)[0] in ("file","folder"):
+        dem_raw = download_drive_any(_dem, raw_dir/"dem")
     else:
         dem_raw = download_to(raw_dir/"dem"/"dem.tif", _dem)
     dem_raw = _resolve_raster_file(dem_raw, ("dem.tif","DEM.tif","dem.vrt"))
+
 
     # Diagnostics captions
     awc_sig = sniff_signature(str(awc_raw)) if awc_raw.exists() and awc_raw.is_file() else ("DIR" if awc_raw.exists() and awc_raw.is_dir() else "MISSING")
