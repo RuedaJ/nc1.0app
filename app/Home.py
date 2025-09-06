@@ -59,38 +59,78 @@ st.info("Enter coordinates and Google Drive links in the sidebar, then click **R
 
 if run:
     errors = []
+    # 1) validate
     if not valid_lat(lat) or not valid_lon(lon):
         errors.append("Invalid coordinates. Please enter valid latitude and longitude.")
+    _awc = st.session_state.get("awc_link_input") or ""
+    _dem = st.session_state.get("dem_link_input") or ""
     if cfg["inputs"]["require_drive_links"]:
-        _awc = st.session_state.get("awc_link_input") or ""
-        _dem = st.session_state.get("dem_link_input") or ""
-        if not looks_like_drive_url(_awc):
-            errors.append("AWC: Invalid Google Drive link.")
-        if not looks_like_drive_url(_dem):
-            errors.append("DEM: Invalid Google Drive link.")
+        if not looks_like_drive_url(_awc): errors.append("AWC: Invalid Google Drive link.")
+        if not looks_like_drive_url(_dem): errors.append("DEM: Invalid Google Drive link.")
+
     if errors:
-        for e in errors:
-            st.error(e)
+        for e in errors: st.error(e)
         S["errors"] = errors
-    else:
-        S["coords"] = (float(lat), float(lon))
-        S["radius_km"] = int(radius_km)
-        S["awc_link"] = st.session_state.get("awc_link_input") or ""
-        S["dem_link"] = st.session_state.get("dem_link_input") or ""
-        S["lc_link"] = (st.session_state.get("lc_link_input") or None)
+        st.stop()
 
-        aoi_gdf = aoi_from_latlon(float(lat), float(lon), float(radius_km), cfg["app"]["crs"])
-        aoi_path = Path(cfg["paths"]["processed"]) / "site_aoi" / f"site_buffer_{radius_km}km.geojson"
-        save_geojson(aoi_gdf, aoi_path)
-        S["aoi_geojson"] = str(aoi_path)
+    # 2) save inputs to state
+    S["coords"] = (float(lat), float(lon))
+    S["radius_km"] = int(radius_km)
+    S["awc_link"] = _awc
+    S["dem_link"] = _dem
+    S["lc_link"]  = (st.session_state.get("lc_link_input") or None)
 
-        raw_dir = Path(cfg["paths"]["raw"])
-        S["awc_path"] = str(local_target_for(awc_link, raw_dir / "awc", "awc.tif"))
-        S["dem_path"] = str(local_target_for(dem_link, raw_dir / "dem", "dem.tif"))
-        if lc_link:
-            S["lc_path"] = str(local_target_for(lc_link, raw_dir / "lc", "lc.gpkg"))
+    # 3) AOI
+    aoi_gdf = aoi_from_latlon(float(lat), float(lon), float(radius_km), cfg["app"]["crs"])
+    aoi_path = Path(cfg["paths"]["processed"]) / "site_aoi" / f"site_buffer_{radius_km}km.geojson"
+    save_geojson(aoi_gdf, aoi_path)
+    S["aoi_geojson"] = str(aoi_path)
 
-        st.success("Inputs validated and AOI created. Proceed to Mapa to visualize the AOI.")
+    # 4) download & cache rasters
+    from etl.drive import drive_share_to_download, local_target_for, is_fresh, download_to
+    awc_url = drive_share_to_download(_awc)
+    dem_url = drive_share_to_download(_dem)
+    raw_dir = Path(cfg["paths"]["raw"])
+    awc_raw = local_target_for(_awc, raw_dir / "awc", "awc.tif")
+    dem_raw = local_target_for(_dem, raw_dir / "dem", "dem.tif")
+
+    ttl = cfg.get("cache", {}).get("drive_ttl_hours", 24)
+    if not is_fresh(awc_raw, ttl): download_to(awc_raw, awc_url)
+    if not is_fresh(dem_raw, ttl): download_to(dem_raw, dem_url)
+
+    S["awc_path"], S["dem_path"] = str(awc_raw), str(dem_raw)
+    S["awc_loaded"], S["dem_loaded"] = True, True
+
+    # 5) clip to AOI + compute slope + score
+    from etl.hydrology import clip_to_aoi, slope_from_dem, reproject_match, infiltration_score
+    import rioxarray as rxr
+    from rasterio.enums import Resampling
+    from pathlib import Path
+
+    awc_da_clip = clip_to_aoi(awc_raw, aoi_path)       # AWC in AOI
+    dem_da_clip = clip_to_aoi(dem_raw, aoi_path)       # DEM in AOI
+    slope_da    = slope_from_dem(dem_raw)              # slope on full DEM grid
+    # match slope to DEM clip grid for consistent AOI window
+    slope_da = reproject_match(slope_da, dem_da_clip, resampling=Resampling.bilinear)
+
+    # Optional LC (fallback=0.5 handled inside infiltration_score)
+    lc_da = None
+    # (If you want LC now: download, clip, then reproject_match to dem_da_clip)
+
+    w_awc = float(st.session_state["awc_weight"])
+    w_slp = float(st.session_state["slope_weight"])
+    w_lc  = float(st.session_state["land_cover_weight"]) if "land_cover_weight" in st.session_state else float(cfg["weights"]["water"]["landcover"])
+
+    score = infiltration_score(awc_da_clip, slope_da, lc_da, w_awc, w_slp, w_lc)
+
+    # 6) save raster + set state for Mapa
+    out_dir = Path(cfg["paths"]["processed"]) / "hydrology"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_tif = out_dir / "InfiltrationScore.tif"
+    score.rio.to_raster(out_tif, compress="LZW")
+    S["infiltration_path"] = str(out_tif)
+
+    st.success("✅ Analysis completed. Open the **Mapa** page to view the Infiltration layer.")
 
 st.markdown("**Design Spec Snapshot**")
 st.write("- In MVP we focus on the **Water** module using AWC + DEM + (optional) land cover.")
