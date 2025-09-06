@@ -190,8 +190,10 @@ if run:
 
     # Clip & compute
     awc_da_clip = clip_to_aoi(awc_raw, aoi_path)
+    st.caption(f"AWC clip sizes: {[awc_da_clip.sizes[d] for d in awc_da_clip.dims]}")
     if any(sz == 0 for sz in awc_da_clip.sizes.values()):
-        st.error("AWC clip resulted in empty array. Check that AWC overlaps the AOI."); st.stop()
+        st.error("AWC clip resulted in empty array. Check that AWC overlaps the AOI or use a larger radius.")
+        st.stop()
 
     try:
         dem_da_clip = clip_to_aoi(dem_raw, aoi_path)
