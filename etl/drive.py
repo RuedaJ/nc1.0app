@@ -1,4 +1,4 @@
-import os, re, requests, time, shutil
+import os, re, requests, time, shutil, zipfile
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -6,6 +6,26 @@ try:
     import gdown  # robust Google Drive downloader
 except Exception:
     gdown = None
+
+# Avoid circular import issues: only import when needed
+def _sniff_signature(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            head = f.read(2048)
+        h = head.lstrip()
+        if head.startswith(b"II*\x00") or head.startswith(b"MM\x00*"): return "TIFF"
+        if head.startswith(b"II+\x00") or head.startswith(b"MM\x00+"): return "BIGTIFF"
+        if head.startswith(b"PK\x03\x04") or head.startswith(b"PK\x05\x06") or head.startswith(b"PK\x07\x08"): return "ZIP"
+        if head.startswith(b"\x1f\x8b"): return "GZIP"
+        if head.startswith(b"%PDF-"): return "PDF"
+        if head.startswith(b"SQLite format 3\x00"): return "SQLITE"
+        if h.startswith(b"<VRTDataset") or h.startswith(b"<?xml"): return "VRT"
+        low = head.lower()
+        if b"<html" in low or h.startswith(b"<!doctype html"): return "HTML"
+        if h.startswith(b"{") or h.startswith(b"["): return "JSON"
+        return "UNKNOWN"
+    except Exception:
+        return "UNKNOWN"
 
 # --- Patterns ---
 FILE_RE   = re.compile(r"/file/d/([A-Za-z0-9_-]{20,})")
@@ -68,7 +88,7 @@ def _find_first_raster_in_dir(d: Path, exts=RASTER_EXTS) -> Path | None:
     if not d.exists() or not d.is_dir():
         return None
     for ext in exts:
-        cands = sorted(d.rglob(f"*{ext}"))  # search recursively for nested files
+        cands = sorted(d.rglob(f"*{ext}"))  # recursive search
         if cands:
             return cands[0]
     return None
@@ -82,10 +102,23 @@ def _cleanup_parts(d: Path) -> None:
         except Exception:
             pass
 
+def _maybe_unzip(path: Path, into: Path) -> Path | None:
+    try:
+        if zipfile.is_zipfile(path):
+            into.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(path, "r") as z:
+                z.extractall(into)
+            cand = _find_first_raster_in_dir(into, RASTER_EXTS)
+            return cand
+    except Exception:
+        return None
+    return None
+
 def download_drive_any(url: str, dest_dir: Path, prefer_exts=RASTER_EXTS) -> Path:
     """Download a Google Drive file or folder; return a concrete raster file path.
     - For *folder* links: downloads folder into dest_dir, returns first raster file.
-    - For *file* links: downloads into dest_dir, returns the file path (or the first raster found).
+    - For *file* links: downloads into dest_dir, tries signature if no extension,
+      auto-unzips ZIPs and returns the first raster found.
     """
     if gdown is None:
         raise RuntimeError("gdown is not installed; cannot download Google Drive files.")
@@ -98,27 +131,43 @@ def download_drive_any(url: str, dest_dir: Path, prefer_exts=RASTER_EXTS) -> Pat
     _cleanup_parts(dest_dir)
 
     if kind == "folder":
-        out = gdown.download_folder(id=fid, output=str(dest_dir), quiet=True, use_cookies=False)
-        if not out:
+        out_list = gdown.download_folder(id=fid, output=str(dest_dir), quiet=True, use_cookies=True)
+        if not out_list:
             raise RuntimeError("gdown.download_folder returned no files. Check sharing permissions.")
-        # try to find a raster inside the downloaded folder tree
         ras = _find_first_raster_in_dir(dest_dir, prefer_exts)
         if ras is None:
             raise RuntimeError("Downloaded folder contains no .tif/.tiff/.vrt/.img. Place a raster in the folder or link directly to the file.")
         return ras
 
     # kind == "file"
-    out = gdown.download(id=fid, output=str(dest_dir), quiet=True, fuzzy=True, use_cookies=False)
+    out = gdown.download(id=fid, output=str(dest_dir), quiet=True, fuzzy=True, use_cookies=True)
     if out is None:
         raise RuntimeError("gdown failed to download the Drive file. Check that sharing is 'Anyone with the link'.")
     outp = Path(out)
+
     if outp.is_dir():
         cand = _find_first_raster_in_dir(outp, prefer_exts) or _find_first_raster_in_dir(dest_dir, prefer_exts)
         if cand:
             return cand
+        raise RuntimeError("Downloaded item is a directory without rasters. Put a .tif inside or link directly to the .tif.")
+
+    # If the file has a known raster extension and exists, accept it.
     if outp.suffix.lower() in prefer_exts and outp.exists():
         return outp
 
+    # No extension or unknown extension: inspect signature.
+    sig = _sniff_signature(str(outp))
+    if sig in ("TIFF", "BIGTIFF", "VRT"):
+        return outp
+    if sig == "ZIP":
+        cand = _maybe_unzip(outp, dest_dir)
+        if cand:
+            return cand
+        raise RuntimeError("Downloaded ZIP does not contain a recognized raster (.tif/.tiff/.vrt/.img).")
+    if sig in ("HTML", "JSON", "PDF", "UNKNOWN"):
+        raise RuntimeError(f"Downloaded file is not a raster (sig={sig}). Ensure the Drive link points to the actual .tif and sharing is 'Anyone with the link'.")
+
+    # Last resort
     cand = _find_first_raster_in_dir(dest_dir, prefer_exts)
     if cand:
         return cand
@@ -127,10 +176,8 @@ def download_drive_any(url: str, dest_dir: Path, prefer_exts=RASTER_EXTS) -> Pat
 
 # ---------------- Backward-compat shims ----------------
 def extract_id(url: str) -> str | None:
-    """Legacy: return Drive file/folder id (prefers whichever is present)."""
     _, fid = parse_drive_url(url or "")
     return fid
 
 def download_drive_file(url: str, dest_dir: Path) -> Path:
-    """Legacy: behave like the old function by delegating to folder-aware downloader."""
     return download_drive_any(url, dest_dir)
