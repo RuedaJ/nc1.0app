@@ -26,9 +26,9 @@ gdown>=5.1.0
 
 # Optional: fast tiled raster rendering (enable if you want tile-based map layers)
 # localtileserver needs the large-image stack; only enable if the host supports it.
-# localtileserver>=0.7,<0.9
-# large-image>=1.21,<2
-# large-image-source-gdal>=1.21,<2
+localtileserver>=0.7,<0.9
+large-image>=1.21,<2
+large-image-source-gdal>=1.21,<2
 
 # Optional: PDF export (requires system libs: cairo, pango, gdk-pixbuf)
 # weasyprint>=62.0
