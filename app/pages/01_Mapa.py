@@ -17,7 +17,7 @@ import rioxarray as rxr
 from shapely.geometry import box
 from pyproj import Transformer
 
-# Map libs (make streamlit-folium mandatory for better UX)
+# Map libs (streamlit-folium is required for click inspector)
 import folium
 from streamlit_folium import st_folium
 
@@ -52,6 +52,7 @@ with st.sidebar:
 
 # ---------- Helpers ----------
 def add_aoi_to_folium_map(fm: folium.Map, aoi_path: str):
+    """Add AOI without re-fitting the map (so the raster fit remains authoritative)."""
     try:
         gdf = gpd.read_file(aoi_path)
         gj = folium.GeoJson(
@@ -61,9 +62,6 @@ def add_aoi_to_folium_map(fm: folium.Map, aoi_path: str):
                 {"color": "#0066CC", "weight": 2, "fill": False},
         )
         gj.add_to(fm)
-        # Fit to AOI bounds (we call this AFTER adding raster so raster stays the last fit if both overlap)
-        minx, miny, maxx, maxy = gdf.to_crs(4326).total_bounds
-        fm.fit_bounds([[miny, minx], [maxy, maxx]])
     except Exception as e:
         st.warning(f"Could not render AOI: {e}")
 
@@ -77,10 +75,11 @@ def add_site_marker_to_folium_map(fm: folium.Map, lat: float, lon: float):
         popup="Site",
     ).add_to(fm)
 
-def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: float, palette_name: str, stretch_kind: str):
+def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
+                         opacity: float, palette_name: str, stretch_kind: str):
     """
     Preferred: localtileserver (if installed) via leafmap.common.get_local_tile_layer
-    Fallback: reproject -> (optional downsample) -> normalize -> colorize -> ImageOverlay with live opacity
+    Fallback: reproject -> (optional downsample) -> robust normalize -> colorize -> ImageOverlay
     """
     # Try local tiles first (if available)
     try:
@@ -110,8 +109,18 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: floa
             resolution=(abs(resx) / scale, abs(resy) / scale),
             resampling=Resampling.bilinear,
         )
+        h = da_4326.sizes[da_4326.dims[0]]
+        w = da_4326.sizes[da_4326.dims[1]]
 
     arr = da_4326.values.astype("float32")
+
+    # Robust nodata handling (incl. common -9999 sentinel)
+    nodata = da_4326.rio.nodata
+    if nodata is not None:
+        arr = np.where(np.isclose(arr, nodata), np.nan, arr)
+    arr = np.where(arr <= -1e4, np.nan, arr)
+
+    # Normalize for display
     finite = np.isfinite(arr)
     if finite.any():
         if stretch_kind == "p2–p98":
@@ -123,24 +132,27 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: floa
             arr = (arr - vmin) / max(vmax - vmin, 1e-6)
             st.caption(f"Infiltration display: valid%={100*np.mean(finite):.1f}, min={vmin:.4f}, max={vmax:.4f}")
     else:
-        arr = np.zeros_like(arr)
         st.caption("Infiltration display: no finite values; rendering blank.")
+        arr = np.zeros_like(arr)
 
     rgba = (cm.get_cmap(palette_name)(np.clip(arr, 0, 1)) * 255).astype("uint8")
 
-    south, west, north, east = da_4326.rio.bounds()
+    # Correct bounds order: rioxarray returns (left, bottom, right, top)
+    left, bottom, right, top = da_4326.rio.bounds()
+    bounds = [[bottom, left], [top, right]]
+
     folium.raster_layers.ImageOverlay(
-        image=rgba,                              # pass RGBA ndarray
-        bounds=[[south, west], [north, east]],
+        image=rgba,                     # RGBA array
+        bounds=bounds,
         name=name,
-        opacity=float(opacity),                  # bind slider value
+        opacity=float(opacity),         # bind slider value live
         interactive=False,
         cross_origin=False,
         zindex=500,
     ).add_to(fm)
 
-    # Fit to the overlay bounds to ensure it's visible
-    fm.fit_bounds([[south, west], [north, east]])
+    # Fit to the overlay bounds so it's visible
+    fm.fit_bounds(bounds)
     folium.LayerControl(collapsed=False).add_to(fm)
 
 def sample_tiff_value(tif_path: str, lon: float, lat: float):
@@ -200,13 +212,13 @@ fm = folium.Map(location=base_loc, zoom_start=12, control_scale=True, tiles="Car
 # Raster first (so its fit_bounds wins)
 add_raster_to_folium(fm, str(infil_path), "Infiltration", opacity, palette, stretch)
 
-# AOI & site
+# AOI & site (no re-fit here; raster fit remains on screen)
 if aoi_geojson and Path(aoi_geojson).exists() and show_aoi:
     add_aoi_to_folium_map(fm, aoi_geojson)
 if show_site and coords:
     add_site_marker_to_folium_map(fm, coords[0], coords[1])
 
-# Render & click inspector with streamlit-folium
+# Render & click inspector
 st_data = st_folium(fm, height=640, use_container_width=True, returned_objects=["last_clicked"])
 last = st_data.get("last_clicked")
 with st.expander("Inspector", expanded=bool(last)):
