@@ -12,7 +12,7 @@ rioxarray>=0.15
 shapely>=2.0,<3
 pyproj>=3.6,<3.7
 geopandas>=0.14,<1.0
-pyogrio>=0.7         # preferred backend for geopandas (avoids Fiona/GDAL build issues)
+pyogrio>=0.7         # faster, avoids Fiona/GDAL build pain
 Pillow>=10.0
 matplotlib>=3.8
 
@@ -25,11 +25,10 @@ leafmap>=0.38
 gdown>=5.1.0
 
 # Optional: fast tiled raster rendering (enable if you want tile-based map layers)
-# localtileserver needs the large-image stack; comment these in if you plan to use tiles
+# localtileserver needs the large-image stack; only enable if the host supports it.
 # localtileserver>=0.7,<0.9
 # large-image>=1.21,<2
 # large-image-source-gdal>=1.21,<2
 
-# Optional: PDF export (WeasyPrint requires system libs: cairo, pango, gdk-pixbuf)
-# Only enable if your hosting environment provides them.
+# Optional: PDF export (requires system libs: cairo, pango, gdk-pixbuf)
 # weasyprint>=62.0
