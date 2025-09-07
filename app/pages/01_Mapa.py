@@ -1,3 +1,4 @@
+```python
 # app/pages/01_Mapa.py
 import sys, os
 from pathlib import Path
@@ -14,7 +15,6 @@ import rasterio as rio
 from rasterio.enums import Resampling
 from rasterio.windows import Window
 import rioxarray as rxr
-from shapely.geometry import box
 from pyproj import Transformer
 
 # Map libs
@@ -35,8 +35,7 @@ except Exception:
 # Fallback colorizing / image embed
 import matplotlib.cm as cm
 from PIL import Image
-import base64
-import io
+import base64, io
 
 from state import get_state
 
@@ -64,7 +63,7 @@ with st.sidebar:
     if not HAS_STF:
         st.info("For click-to-inspect, add `streamlit-folium` to requirements. Using fallback display.")
 
-# ---------- Shared helpers ----------
+# ---------- Helpers ----------
 def add_aoi_to_folium_map(fm: folium.Map, aoi_path: str):
     try:
         gdf = gpd.read_file(aoi_path)
@@ -75,7 +74,6 @@ def add_aoi_to_folium_map(fm: folium.Map, aoi_path: str):
                 {"color": "#0066CC", "weight": 2, "fill": False},
         )
         gj.add_to(fm)
-        # Fit to AOI bounds
         minx, miny, maxx, maxy = gdf.to_crs(4326).total_bounds
         fm.fit_bounds([[miny, minx], [maxy, maxx]])
     except Exception as e:
@@ -92,15 +90,52 @@ def add_site_marker_to_folium_map(fm: folium.Map, lat: float, lon: float):
     ).add_to(fm)
 
 def _rgba_data_uri(rgba: np.ndarray) -> str:
-    """Encode RGBA uint8 image to data URI PNG so Folium can always render it."""
     im = Image.fromarray(rgba, mode="RGBA")
     buf = io.BytesIO()
     im.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
     return f"data:image/png;base64,{b64}"
 
+@st.cache_data(show_spinner=False)
+def _prep_overlay_for_display(tif_path: str, max_px: int = 1024):
+    """
+    Load -> reproject to EPSG:4326 -> optional downsample.
+    Returns (arr_float32, (south, west, north, east), nodata_value).
+    """
+    with rio.open(tif_path) as src:
+        nodata = src.nodata
+        st.caption(
+            f"Infiltration GeoTIFF — shape={src.height}x{src.width}, crs={src.crs}, "
+            f"dtype={src.dtypes[0]}, nodata={nodata}"
+        )
+    da = rxr.open_rasterio(tif_path, masked=True).squeeze()
+    if not da.rio.crs:
+        raise ValueError("Infiltration raster has no CRS.")
+    da_4326 = da.rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
+
+    # Downsample to keep frontend fast
+    max_px = int(max(256, max_px))
+    h, w = da_4326.sizes[da_4326.dims[0]], da_4326.sizes[da_4326.dims[1]]
+    if max(h, w) > max_px:
+        resx, resy = da_4326.rio.resolution()
+        scale = max_px / max(h, w)  # 0<scale<1
+        # Increase resolution (coarser) by 1/scale
+        da_4326 = da_4326.rio.reproject(
+            "EPSG:4326",
+            resolution=(abs(resx) / scale, abs(resy) / scale),
+            resampling=Resampling.bilinear,
+        )
+
+    arr = da_4326.values.astype("float32")
+    bounds = da_4326.rio.bounds()
+    return arr, bounds, nodata
+
 def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: float):
-    """Try local tiles; else embed PNG as base64 ImageOverlay."""
+    """
+    Try fast tiles (localtileserver); else cached ImageOverlay with:
+    - nodata-aware transparency
+    - percentile stretch (2–98%) for good contrast
+    """
     if HAS_LTS:
         try:
             tile_layer, _client = get_local_tile_layer(
@@ -116,47 +151,45 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: floa
         except Exception as e:
             st.info(f"`localtileserver` path unavailable ({e}). Using ImageOverlay fallback.")
 
-    # Fallback: reproject to EPSG:4326 → normalize → colorize → embed as data URI
-    da = rxr.open_rasterio(tif_path, masked=True).squeeze()
-    da_4326 = da.rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
+    # Fallback overlay
+    try:
+        arr, (south, west, north, east), nodata = _prep_overlay_for_display(tif_path)
+    except Exception as e:
+        st.error(f"Failed to prepare infiltration overlay: {e}")
+        return
 
-    # Downsample if large to keep frontend fast
-    max_px = 1024
-    h, w = da_4326.sizes[da_4326.dims[0]], da_4326.sizes[da_4326.dims[1]]
-    scale = min(1.0, max_px / max(h, w))
-    if scale < 1.0:
-        resx, resy = da_4326.rio.resolution()
-        da_4326 = da_4326.rio.reproject(
-            "EPSG:4326",
-            resolution=(abs(resx) / scale, abs(resy) / scale),
-            resampling=Resampling.bilinear,
-        )
+    if arr.size == 0 or arr.shape[0] == 0 or arr.shape[1] == 0:
+        st.warning("Infiltration raster has zero-size after clipping/reprojection. Check AOI overlap and input coverage.")
+        return
 
-    arr = da_4326.values.astype("float32")
     finite = np.isfinite(arr)
-    # Display stats to debug flat/NaN rasters
-    if finite.any():
-        vmin, vmax = float(np.nanmin(arr[finite])), float(np.nanmax(arr[finite]))
-        st.caption(f"Infiltration stats (display): min={vmin:.4f}, max={vmax:.4f}, finite%={100*np.mean(finite):.1f}")
-        if vmax > vmin:
-            arr = (arr - vmin) / (vmax - vmin)
+    valid = finite.copy()
+    if nodata is not None and np.isfinite(nodata):
+        valid &= arr != float(nodata)
+
+    valid_ratio = float(valid.sum()) / valid.size if valid.size else 0.0
+    st.caption(f"Infiltration display: valid%={100*valid_ratio:.1f}")
+
+    if valid.any():
+        # Percentile stretch for robust contrast
+        qlo, qhi = np.nanpercentile(arr[valid], [2, 98])
+        if qhi > qlo:
+            arr_norm = (arr - qlo) / (qhi - qlo)
         else:
-            arr = np.zeros_like(arr)
+            arr_norm = np.zeros_like(arr, dtype="float32")
     else:
-        st.caption("Infiltration display: no finite values; rendering blank.")
-        arr = np.zeros_like(arr)
+        arr_norm = np.zeros_like(arr, dtype="float32")
 
-    rgba = (cm.get_cmap("Blues")(np.clip(arr, 0, 1)) * 255).astype("uint8")
-    # Apply overall opacity via alpha channel
-    if 0.0 <= opacity < 1.0:
-        rgba[..., 3] = (rgba[..., 3].astype("float32") * opacity).astype("uint8")
+    rgba = (cm.get_cmap("Blues")(np.clip(arr_norm, 0, 1)) * 255).astype("uint8")
+    # Make invalid pixels transparent and apply global opacity
+    rgba[~valid, 3] = 0
+    rgba[..., 3] = (rgba[..., 3].astype("float32") * opacity).astype("uint8")
 
-    south, west, north, east = da_4326.rio.bounds()
     folium.raster_layers.ImageOverlay(
         image=_rgba_data_uri(rgba),
         bounds=[[south, west], [north, east]],
         name=name,
-        opacity=1.0,  # keep 1.0; we already applied alpha to pixels
+        opacity=1.0,  # alpha baked in
         interactive=False,
         cross_origin=False,
         zindex=500,
@@ -221,8 +254,20 @@ if aoi_geojson and Path(aoi_geojson).exists() and show_aoi:
 if show_site and coords:
     add_site_marker_to_folium_map(fm, coords[0], coords[1])
 
-# Raster layer (tiles if possible; otherwise embedded PNG overlay guaranteed to render)
+# Raster layer (tiles if possible; otherwise embedded PNG overlay)
 add_raster_to_folium(fm, str(infil_path), "Infiltration", opacity)
+
+# Simple legend
+legend_html = """
+<div style="position:relative;margin-top:6px;">
+  <div style="font:12px/1.2 sans-serif;color:#333;">Infiltration (0 → 1)</div>
+  <div style="height:10px;background:linear-gradient(to right,#f7fbff,#deebf7,#9ecae1,#4292c6,#08519c);"></div>
+  <div style="display:flex;justify-content:space-between;font:11px sans-serif;color:#555;">
+    <span>0.0</span><span>0.5</span><span>1.0</span>
+  </div>
+</div>
+"""
+st.markdown(legend_html, unsafe_allow_html=True)
 
 if HAS_STF:
     st_data = st_folium(fm, height=640, returned_objects=["last_clicked"])
@@ -243,7 +288,7 @@ if HAS_STF:
         else:
             st.write("Click on the map to inspect values at a point.")
 else:
-    # If streamlit-folium is missing, render a static map snapshot and manual sampler
+    # Static snapshot + manual sampler
     st.info("Install `streamlit-folium` for click inspector. Showing map and manual sampler.")
     html_path = Path("data/processed/_tmp_map.html"); html_path.parent.mkdir(parents=True, exist_ok=True)
     fm.save(str(html_path))
@@ -266,3 +311,4 @@ else:
             st.markdown(f"- Slope (norm ~[0–1]): **{slope_val:.3f}**" if slope_val is not None else "- Slope: n/a")
 
 st.success("Map ready. Adjust opacity, toggle AOI, and inspect values.")
+```
