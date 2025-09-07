@@ -1,22 +1,35 @@
-streamlit>=1.36
-geopandas>=0.14
-shapely>=2.0
-pyproj>=3.6
+# Core app
+streamlit>=1.36,<2
+pyyaml>=6.0
+requests>=2.31
+
+# Geo stack
+numpy>=1.26,<2.0
+pandas>=2.2
+xarray>=2024.1.0
 rasterio>=1.3
 rioxarray>=0.15
-xarray>=2024.1.0
-numpy>=1.26
-pandas>=2.2
-folium>=0.16
-requests>=2.31
-pyyaml>=6.0
+shapely>=2.0,<3
+pyproj>=3.6,<3.7
+geopandas>=0.14,<1.0
+pyogrio>=0.7         # preferred backend for geopandas (avoids Fiona/GDAL build issues)
+Pillow>=10.0
 matplotlib>=3.8
-jinja2>=3.1
-weasyprint>=62.0
-gdown>=5.1.0
-leafmap>=0.32.0
-streamlit-folium>=0.18.0
-Pillow
 
-# optional for faster tiled rendering:
-localtileserver>=0.7
+# Map rendering
+folium>=0.16
+streamlit-folium>=0.20
+leafmap>=0.38
+
+# Downloads / helpers
+gdown>=5.1.0
+
+# Optional: fast tiled raster rendering (enable if you want tile-based map layers)
+# localtileserver needs the large-image stack; comment these in if you plan to use tiles
+# localtileserver>=0.7,<0.9
+# large-image>=1.21,<2
+# large-image-source-gdal>=1.21,<2
+
+# Optional: PDF export (WeasyPrint requires system libs: cairo, pango, gdk-pixbuf)
+# Only enable if your hosting environment provides them.
+# weasyprint>=62.0
