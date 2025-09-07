@@ -2,7 +2,7 @@
 import sys, os
 from pathlib import Path
 
-# Ensure repo root on path so we can import state & etl modules
+# Ensure repo root on path
 _REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -14,13 +14,9 @@ import rasterio as rio
 from rasterio.enums import Resampling
 from rasterio.windows import Window
 import rioxarray as rxr
-from shapely.geometry import box
 from pyproj import Transformer
-
-# Map libs (streamlit-folium is required for click inspector)
 import folium
 from streamlit_folium import st_folium
-
 import matplotlib.cm as cm
 
 from state import get_state
@@ -50,9 +46,7 @@ with st.sidebar:
     show_aoi = st.checkbox("Show AOI", value=True)
     show_site = st.checkbox("Show site marker", value=True)
 
-# ---------- Helpers ----------
 def add_aoi_to_folium_map(fm: folium.Map, aoi_path: str):
-    """Add AOI without re-fitting the map (so the raster fit remains authoritative)."""
     try:
         gdf = gpd.read_file(aoi_path)
         gj = folium.GeoJson(
@@ -77,11 +71,7 @@ def add_site_marker_to_folium_map(fm: folium.Map, lat: float, lon: float):
 
 def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
                          opacity: float, palette_name: str, stretch_kind: str):
-    """
-    Preferred: localtileserver (if installed) via leafmap.common.get_local_tile_layer
-    Fallback: reproject -> (optional downsample) -> robust normalize -> colorize -> ImageOverlay
-    """
-    # Try local tiles first (if available)
+    # Try fast tiles (requires localtileserver + psutil + large-image stack)
     try:
         from leafmap.common import get_local_tile_layer
         tile_layer, _client = get_local_tile_layer(
@@ -91,9 +81,9 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
         folium.LayerControl(collapsed=False).add_to(fm)
         return
     except Exception as e:
-        st.info(f"`localtileserver` not available ({e}). Using ImageOverlay fallback.")
+        st.info(f"localtileserver not available ({e}). Using ImageOverlay fallback.")
 
-    # Fallback pipeline
+    # Fallback: reproject → downsample → clean nodata/sentinels → stretch → colorize → overlay
     da = rxr.open_rasterio(tif_path, masked=True).squeeze()
     da_4326 = da.rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
 
@@ -109,18 +99,20 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
             resolution=(abs(resx) / scale, abs(resy) / scale),
             resampling=Resampling.bilinear,
         )
-        h = da_4326.sizes[da_4326.dims[0]]
-        w = da_4326.sizes[da_4326.dims[1]]
 
     arr = da_4326.values.astype("float32")
 
-    # Robust nodata handling (incl. common -9999 sentinel)
-    nodata = da_4326.rio.nodata
-    if nodata is not None:
-        arr = np.where(np.isclose(arr, nodata), np.nan, arr)
-    arr = np.where(arr <= -1e4, np.nan, arr)
+    # Robust nodata/sentinel cleanup
+    nd = da_4326.rio.nodata
+    if nd is not None:
+        arr = np.where(np.isclose(arr, nd, atol=1e-3), np.nan, arr)
+    # Common sentinels
+    arr = np.where(arr <= -9_000, np.nan, arr)     # –9999 style
+    arr = np.where(arr <= -1e30, np.nan, arr)      # absurd negatives
+    # Infiltration expected ~0..1 → drop out-of-range that break visualization
+    arr = np.where(arr < 0, np.nan, arr)
+    arr = np.where(arr > 1e6, np.nan, arr)
 
-    # Normalize for display
     finite = np.isfinite(arr)
     if finite.any():
         if stretch_kind == "p2–p98":
@@ -137,21 +129,19 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
 
     rgba = (cm.get_cmap(palette_name)(np.clip(arr, 0, 1)) * 255).astype("uint8")
 
-    # Correct bounds order: rioxarray returns (left, bottom, right, top)
-    left, bottom, right, top = da_4326.rio.bounds()
+    left, bottom, right, top = da_4326.rio.bounds()  # (x_min, y_min, x_max, y_max)
     bounds = [[bottom, left], [top, right]]
 
     folium.raster_layers.ImageOverlay(
-        image=rgba,                     # RGBA array
+        image=rgba,
         bounds=bounds,
         name=name,
-        opacity=float(opacity),         # bind slider value live
+        opacity=float(opacity),
         interactive=False,
         cross_origin=False,
         zindex=500,
     ).add_to(fm)
 
-    # Fit to the overlay bounds so it's visible
     fm.fit_bounds(bounds)
     folium.LayerControl(collapsed=False).add_to(fm)
 
@@ -170,7 +160,6 @@ def sample_tiff_value(tif_path: str, lon: float, lat: float):
         return None
 
 def sample_slope_from_dem(dem_path: str, lon: float, lat: float):
-    """Approximate normalized slope [0,1] from a 3x3 window at click location."""
     try:
         if not dem_path or not Path(dem_path).exists():
             return None
@@ -209,10 +198,10 @@ def sample_slope_from_dem(dem_path: str, lon: float, lat: float):
 base_loc = (coords[0], coords[1]) if coords else (41.65, -0.89)
 fm = folium.Map(location=base_loc, zoom_start=12, control_scale=True, tiles="CartoDB positron")
 
-# Raster first (so its fit_bounds wins)
+# Raster first (its fit_bounds wins)
 add_raster_to_folium(fm, str(infil_path), "Infiltration", opacity, palette, stretch)
 
-# AOI & site (no re-fit here; raster fit remains on screen)
+# AOI & site (do not refit, to keep raster centered)
 if aoi_geojson and Path(aoi_geojson).exists() and show_aoi:
     add_aoi_to_folium_map(fm, aoi_geojson)
 if show_site and coords:
