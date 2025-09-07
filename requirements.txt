@@ -19,4 +19,4 @@ streamlit-folium>=0.18.0
 Pillow
 
 # optional for faster tiled rendering:
-localtileserver>=0.7.4
+localtileserver>=0.7
