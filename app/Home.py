@@ -21,6 +21,13 @@ from shapely.geometry import box
 
 st.set_page_config(page_title="sustai-geo-app", layout="wide")
 
+try:
+    cap = st.runtime.get_option("server.maxUploadSize")
+except Exception:
+    cap = st.config.get_option("server.maxUploadSize")
+st.caption(f"Max upload size (MB) in effect: {cap}")
+
+
 cfg = yaml.safe_load(Path("configs/default.yaml").read_text())
 S = get_state()
 
