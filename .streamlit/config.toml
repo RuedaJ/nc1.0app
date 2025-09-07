@@ -1,0 +1,6 @@
+[server]
+# per-file limit for st.file_uploader (in MB)
+maxUploadSize = 2048
+
+# (optional) bump the WebSocket message size if you still hit limits
+# maxMessageSize = 2048
