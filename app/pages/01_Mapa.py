@@ -1,4 +1,3 @@
-```python
 # app/pages/01_Mapa.py
 import sys, os
 from pathlib import Path
