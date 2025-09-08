@@ -2,7 +2,7 @@
 import sys, os
 from pathlib import Path
 
-# Ensure repo root on path
+# Ensure repo root on path so we can import state & etl modules
 _REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -14,14 +14,16 @@ import rasterio as rio
 from rasterio.enums import Resampling
 from rasterio.windows import Window
 import rioxarray as rxr
+from shapely.geometry import box
 from pyproj import Transformer
 
+# Map libs (streamlit-folium for click inspector)
 import folium
 from streamlit_folium import st_folium
-import matplotlib.cm as cm
 
-from PIL import Image
-import io, base64
+# Color maps & legend
+from matplotlib import colormaps as mpl_cmaps
+import branca.colormap as bcm
 
 from state import get_state
 
@@ -61,6 +63,10 @@ def add_aoi_to_folium_map(fm: folium.Map, aoi_path: str):
                 {"color": "#0066CC", "weight": 2, "fill": False},
         )
         gj.add_to(fm)
+        # (Optional) Fit to AOI bounds – we already fit to raster below,
+        # AOI will just ensure the view is reasonable if raster is tiny.
+        minx, miny, maxx, maxy = gdf.to_crs(4326).total_bounds
+        fm.fit_bounds([[miny, minx], [maxy, maxx]])
     except Exception as e:
         st.warning(f"Could not render AOI: {e}")
 
@@ -74,57 +80,48 @@ def add_site_marker_to_folium_map(fm: folium.Map, lat: float, lon: float):
         popup="Site",
     ).add_to(fm)
 
-def _png_data_uri_from_rgba(rgba_uint8: np.ndarray) -> str:
-    """Encode RGBA uint8 array to data URI PNG for robust overlay rendering."""
-    img = Image.fromarray(rgba_uint8, mode="RGBA")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{b64}"
+def _rgba_to_hex(rgba):
+    r, g, b, a = rgba
+    return "#{:02x}{:02x}{:02x}".format(int(r*255), int(g*255), int(b*255))
 
 def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
                          opacity: float, palette_name: str, stretch_kind: str):
-    # --- Try fast tiles first ---
+    """
+    Preferred: localtileserver via leafmap.common.get_local_tile_layer
+    Fallback: reproject -> (optional) downsample -> normalize -> colorize -> ImageOverlay with live opacity
+    """
+    # Try local tiles first (if available)
     try:
         from leafmap.common import get_local_tile_layer
-
-        # Some leafmap versions want layer_name=...; older ones want name=...
         try:
+            # Newer signature prefers layer_name=...
             out = get_local_tile_layer(
-                tif_path,
-                layer_name=name,           # new kw
-                palette=palette_name,
-                vmin=0, vmax=1,
-                opacity=float(opacity),
+                tif_path, layer_name=name, palette=palette_name, vmin=0, vmax=1, opacity=float(opacity)
             )
         except TypeError:
+            # Older signature uses name=...
             out = get_local_tile_layer(
-                tif_path,
-                name=name,                 # fallback kw
-                palette=palette_name,
-                vmin=0, vmax=1,
-                opacity=float(opacity),
+                tif_path, name=name, palette=palette_name, vmin=0, vmax=1, opacity=float(opacity)
             )
-
-        # Return type can be either a BoundTileLayer or a (layer, client) tuple
+        # Handle both return types (BoundTileLayer vs tuple)
         try:
-            tile_layer, _client = out      # new style returns a single object -> raises here
+            tile_layer, _client = out
         except Exception:
-            tile_layer = out               # BoundTileLayer
-
+            tile_layer = out
         tile_layer.add_to(fm)
+        # No legend here; we add a static legend below.
         return
-
     except Exception as e:
         st.info(f"localtileserver not available ({e}). Using ImageOverlay fallback.")
 
-    # --- Fallback: reproject → (optional) downsample → clean → stretch → colorize → ImageOverlay ---
+    # Fallback pipeline
     da = rxr.open_rasterio(tif_path, masked=True).squeeze()
     da_4326 = da.rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
 
     # Downsample for snappy UI
-    max_px = 1280  # you can bump to 1536/2048 if you want sharper overlays
-    h, w = da_4326.sizes[da_4326.dims[0]], da_4326.sizes[da_4326.dims[1]]
+    max_px = 1280
+    h = da_4326.sizes[da_4326.dims[0]]
+    w = da_4326.sizes[da_4326.dims[1]]
     scale = min(1.0, max_px / max(h, w))
     if scale < 1.0:
         resx, resy = da_4326.rio.resolution()
@@ -138,7 +135,7 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
     nd = da_4326.rio.nodata
     if nd is not None:
         arr = np.where(np.isclose(arr, nd, atol=1e-3), np.nan, arr)
-    arr = np.where(arr <= -9_000, np.nan, arr)   # –9999 style
+    arr = np.where(arr <= -9_000, np.nan, arr)   # –9999 style nodata
     arr = np.where(arr < 0, np.nan, arr)
     arr = np.where(arr > 1e6, np.nan, arr)
 
@@ -156,11 +153,13 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
         arr = np.zeros_like(arr)
         st.caption("Infiltration display: no finite values; rendering blank.")
 
-    rgba = (cm.get_cmap(palette_name)(np.clip(arr, 0, 1)) * 255).astype("uint8")
+    cmap = mpl_cmaps.get_cmap(palette_name)
+    # cmap returns RGBA 0..1; convert to 8-bit for ImageOverlay
+    rgba = (cmap(np.clip(arr, 0, 1)) * 255).astype("uint8")
 
     south, west, north, east = da_4326.rio.bounds()
     folium.raster_layers.ImageOverlay(
-        image=rgba,                 # pass ndarray directly (no caching issues)
+        image=rgba,
         bounds=[[south, west], [north, east]],
         name=name,
         opacity=float(opacity),
@@ -169,18 +168,8 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
         zindex=500,
     ).add_to(fm)
 
-    # Keep map focused on the raster
+    # Fit to the overlay bounds to ensure it's visible
     fm.fit_bounds([[south, west], [north, east]])
-
-import branca.colormap as bcm
-# Build a 0–1 legend (since we normalize in display)
-cmap = bcm.LinearColormap(
-    colors=[cm.get_cmap(palette)(x) for x in np.linspace(0, 1, 6)],
-    vmin=0, vmax=1
-).to_step(index=[0, 0.2, 0.4, 0.6, 0.8, 1])
-cmap.caption = "Infiltration (0 → 1)"
-cmap.add_to(fm)
-
 
 def sample_tiff_value(tif_path: str, lon: float, lat: float):
     try:
@@ -197,6 +186,7 @@ def sample_tiff_value(tif_path: str, lon: float, lat: float):
         return None
 
 def sample_slope_from_dem(dem_path: str, lon: float, lat: float):
+    """Approximate normalized slope [0,1] from a 3x3 window at click location."""
     try:
         if not dem_path or not Path(dem_path).exists():
             return None
@@ -233,23 +223,23 @@ def sample_slope_from_dem(dem_path: str, lon: float, lat: float):
 
 # ---------- Render ----------
 base_loc = (coords[0], coords[1]) if coords else (41.65, -0.89)
-fm = folium.Map(location=base_loc, zoom_start=12, control_scale=True, tiles=None)
+fm = folium.Map(location=base_loc, zoom_start=12, control_scale=True, tiles="CartoDB positron")
 
-# Basemaps (make sure at least one is present)
-folium.TileLayer("OpenStreetMap", name="OSM").add_to(fm)
-folium.TileLayer("CartoDB positron", name="CartoDB Positron").add_to(fm)
-
-# Raster first (its fit_bounds wins)
+# Raster first (so we fit to it)
 add_raster_to_folium(fm, str(infil_path), "Infiltration", opacity, palette, stretch)
 
-# AOI & site (do not refit, to keep raster centered)
+# Legend (0–1 normalized)
+cmap_mpl = mpl_cmaps.get_cmap(palette)
+hex_colors = [_rgba_to_hex(cmap_mpl(x)) for x in np.linspace(0, 1, 6)]
+legend = bcm.LinearColormap(colors=hex_colors, vmin=0, vmax=1).to_step(index=[0, 0.2, 0.4, 0.6, 0.8, 1])
+legend.caption = "Infiltration (0 → 1)"
+legend.add_to(fm)
+
+# AOI & site
 if aoi_geojson and Path(aoi_geojson).exists() and show_aoi:
     add_aoi_to_folium_map(fm, aoi_geojson)
 if show_site and coords:
     add_site_marker_to_folium_map(fm, coords[0], coords[1])
-
-# Layer control last
-folium.LayerControl(collapsed=False).add_to(fm)
 
 # Render & click inspector
 st_data = st_folium(fm, height=640, use_container_width=True, returned_objects=["last_clicked"])
