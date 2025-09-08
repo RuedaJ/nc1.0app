@@ -1,6 +1,6 @@
 """
 Mapa: base + AOI + Infiltration raster with opacity and inspector.
-Uses localtileserver when available; falls back to ImageOverlay otherwise.
+Self-contained: uses localtileserver directly if present; otherwise falls back to ImageOverlay.
 """
 
 from __future__ import annotations
@@ -20,12 +20,14 @@ import streamlit as st
 import folium
 from streamlit_folium import st_folium
 
-# Try to use tiled rasters if helper exists; otherwise, no crash.
+# Try localtileserver inline (no dependency on app.tiles)
 try:
-    from app.tiles import raster_tile_layer
+    from localtileserver import TileClient, get_leaflet_tile_layer  # type: ignore
 except Exception:
-    raster_tile_layer = None  # fallback later
+    TileClient = None
+    get_leaflet_tile_layer = None
 
+# ETL / utils
 from etl.io import read_vector
 from etl import hydrology as hydro
 
@@ -33,7 +35,7 @@ from etl import hydrology as hydro
 try:
     import rasterio
     from rasterio.warp import transform_bounds
-except Exception:  # keep page working even if rasterio import fails
+except Exception:
     rasterio = None
     transform_bounds = None
 
@@ -62,7 +64,7 @@ DEFAULT_PATHS = {
 }
 
 # ---------------------------
-# Page setup
+# Page config & state
 # ---------------------------
 st.set_page_config(page_title="Mapa", layout="wide")
 st.title("🗺️ Mapa")
@@ -92,7 +94,7 @@ with st.sidebar:
     zoom_to_aoi = st.button("Zoom a AOI")
 
     st.divider()
-    st.caption("Consejo: si no hay tiles locales, se usará una superposición estática.")
+    st.caption("Si no hay tiles locales, se usará una superposición estática.")
 
 # ---------------------------
 # Map build
@@ -120,9 +122,7 @@ def _add_aoi(map_obj: folium.Map):
         st.caption("AOI: (no encontrado)")
     return None
 
-gdf_aoi = None
-if show_aoi:
-    gdf_aoi = _add_aoi(m)
+gdf_aoi = _add_aoi(m) if show_aoi else None
 
 # ---- Infiltration raster layer
 def _add_infiltration_tiles(map_obj: folium.Map, tif_path: Path, opacity: float) -> bool:
@@ -131,53 +131,52 @@ def _add_infiltration_tiles(map_obj: folium.Map, tif_path: Path, opacity: float)
     Returns True if something was added, else False.
     """
     # Preferred: localtileserver
-    if raster_tile_layer is not None:
+    if TileClient is not None and get_leaflet_tile_layer is not None:
         try:
-            tile, _client = raster_tile_layer(tif_path)
-            # Update opacity on the tile layer if supported
-            try:
-                tile.options["opacity"] = opacity
-            except Exception:
-                pass
+            client = TileClient(str(tif_path))
+            tile = get_leaflet_tile_layer(
+                client,
+                attribution="© data sources",
+                name=tif_path.name,
+                opacity=opacity,
+                shown=True,
+            )
             tile.add_to(map_obj)
             return True
         except Exception as e:
             st.warning(f"No se pudo usar tiles locales (localtileserver): {e}. Probando superposición estática...")
+
     # Fallback: static ImageOverlay using raster bounds -> WGS84
     if rasterio is None or transform_bounds is None:
         st.warning("Rasterio no disponible para la superposición estática.")
         return False
     try:
         with rasterio.open(tif_path) as src:
-            # bounds in source CRS → WGS84 for Leaflet
             left, bottom, right, top = transform_bounds(src.crs, "EPSG:4326", *src.bounds, densify_pts=21)
-            # Render a small, downsampled PNG in memory for overlay
-            # (avoid huge images; this is a fallback)
             data = src.read(1, masked=True)
-            # Normalize to [0, 255] for preview
-            arr = np.array(data, dtype="float64")
-            vmin = np.nanpercentile(arr, 2)
-            vmax = np.nanpercentile(arr, 98)
-            rng = (vmax - vmin) if vmax > vmin else 1.0
-            norm = np.clip((arr - vmin) / rng, 0, 1)
-            rgba = np.dstack([norm*255, norm*255, norm*255, np.where(np.isnan(arr), 0, opacity*255)]).astype("uint8")
 
-            # Encode to PNG
-            from PIL import Image
-            buf = io.BytesIO()
-            Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG")
-            buf.seek(0)
+        arr = np.array(data, dtype="float64")
+        vmin = np.nanpercentile(arr, 2) if np.isfinite(arr).any() else 0.0
+        vmax = np.nanpercentile(arr, 98) if np.isfinite(arr).any() else 1.0
+        rng = (vmax - vmin) if vmax > vmin else 1.0
+        norm = np.clip((arr - vmin) / rng, 0, 1)
+        rgba = np.dstack([norm*255, norm*255, norm*255, np.where(np.isnan(arr), 0, opacity*255)]).astype("uint8")
 
-            folium.raster_layers.ImageOverlay(
-                image=buf,
-                bounds=[[bottom, left], [top, right]],
-                name="Infiltration (static)",
-                opacity=opacity,
-                interactive=False,
-                cross_origin=False,
-                zindex=1,
-            ).add_to(map_obj)
-            return True
+        from PIL import Image
+        buf = io.BytesIO()
+        Image.fromarray(rgba, mode="RGBA").save(buf, format="PNG")
+        buf.seek(0)
+
+        folium.raster_layers.ImageOverlay(
+            image=buf,
+            bounds=[[bottom, left], [top, right]],
+            name="Infiltration (static)",
+            opacity=opacity,
+            interactive=False,
+            cross_origin=False,
+            zindex=1,
+        ).add_to(map_obj)
+        return True
     except Exception as e:
         st.warning(f"Fallo en superposición estática: {e}")
         return False
@@ -207,7 +206,6 @@ folium.LayerControl().add_to(m)
 if zoom_to_aoi and gdf_aoi is not None and len(gdf_aoi) > 0:
     try:
         bounds = gdf_aoi.total_bounds  # minx, miny, maxx, maxy in 4326
-        # Store it in session and the map will center after render via fit_bounds
         state["fit_bounds"] = [[bounds[1], bounds[0]], [bounds[3], bounds[2]]]
     except Exception as e:
         st.warning(f"No se pudo centrar a AOI: {e}")
@@ -218,14 +216,9 @@ ret = st_folium(
     width=None,
     height=700,
     returned_objects=["last_clicked"],
-    center=state.get("fit_bounds") is None,
-    feature_group_to_add="",
 )
 
-# If we queued a fit_bounds, instruct the frontend. (st_folium supports center param but not direct fit post-render;
-# this is a best-effort: the user can click zoom to AOI and we set the center on next rerun.)
 if "fit_bounds" in state:
-    # Clear it on the next run; Streamlit reruns will refresh.
     del state["fit_bounds"]
 
 # ---------------------------
