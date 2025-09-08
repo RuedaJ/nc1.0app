@@ -3,17 +3,18 @@ Dashboard page: quick KPIs and system health.
 """
 
 from __future__ import annotations
+# === PATH BOOTSTRAP ===
+import sys
 from pathlib import Path
-import json
+_THIS = Path(__file__).resolve()
+_REPO_ROOT = _THIS.parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+# ======================
+
 import streamlit as st
 import psutil
 
-
-def repo_root_from_file(__file__: str) -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-_REPO_ROOT = repo_root_from_file(__file__)
 DATA_DIR = _REPO_ROOT / "data"
 PROC_DIR = DATA_DIR / "processed"
 HYDRO_DIR = PROC_DIR / "hydrology"
@@ -21,11 +22,9 @@ HYDRO_DIR = PROC_DIR / "hydrology"
 st.set_page_config(page_title="Dashboard", layout="wide")
 st.title("📊 Dashboard")
 
-
 # ---------------------------
 # System health
 # ---------------------------
-
 vm = psutil.virtual_memory()
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -35,11 +34,9 @@ with c2:
 with c3:
     st.metric("Procesos", f"{len(psutil.pids())}")
 
-
 # ---------------------------
-# KPIs from session or compute lightweight stats
+# KPIs from session or quick stats from rasters
 # ---------------------------
-
 state = st.session_state
 paths = state.get("paths", {})
 run_stats = state.get("run_stats", {})
@@ -70,10 +67,7 @@ with k_cols[1]:
 with k_cols[2]:
     st.metric("Infiltración (media)", f"{infil_mean:.3f}" if infil_mean is not None else "—")
 with k_cols[3]:
-    if run_stats:
-        st.metric("Duración (s)", run_stats.get("duration_s", "—"))
-    else:
-        st.metric("Duración (s)", "—")
+    st.metric("Duración (s)", run_stats.get("duration_s", "—") if run_stats else "—")
 
 st.divider()
 
