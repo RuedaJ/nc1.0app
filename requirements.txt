@@ -15,6 +15,7 @@ geopandas>=0.14,<1.0
 pyogrio>=0.7         # faster, avoids Fiona/GDAL build pain
 Pillow>=10.0
 matplotlib>=3.8
+branca>=0.7
 
 # Map rendering
 folium>=0.16
