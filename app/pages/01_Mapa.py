@@ -84,30 +84,47 @@ def _png_data_uri_from_rgba(rgba_uint8: np.ndarray) -> str:
 
 def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
                          opacity: float, palette_name: str, stretch_kind: str):
-    # 1) Try fast tiles via localtileserver (if available)
+    # --- Try fast tiles first ---
     try:
         from leafmap.common import get_local_tile_layer
-        # IMPORTANT: recent leafmap expects `layer_name` not `name`
-        tile_layer, _client = get_local_tile_layer(
-            tif_path,
-            layer_name=name,
-            palette=palette_name,
-            vmin=0, vmax=1,
-            opacity=float(opacity),
-        )
+
+        # Some leafmap versions want layer_name=...; older ones want name=...
+        try:
+            out = get_local_tile_layer(
+                tif_path,
+                layer_name=name,           # new kw
+                palette=palette_name,
+                vmin=0, vmax=1,
+                opacity=float(opacity),
+            )
+        except TypeError:
+            out = get_local_tile_layer(
+                tif_path,
+                name=name,                 # fallback kw
+                palette=palette_name,
+                vmin=0, vmax=1,
+                opacity=float(opacity),
+            )
+
+        # Return type can be either a BoundTileLayer or a (layer, client) tuple
+        try:
+            tile_layer, _client = out      # new style returns a single object -> raises here
+        except Exception:
+            tile_layer = out               # BoundTileLayer
+
         tile_layer.add_to(fm)
         return
+
     except Exception as e:
         st.info(f"localtileserver not available ({e}). Using ImageOverlay fallback.")
 
-    # 2) Fallback: reproject → downsample → clean sentinels → stretch → colorize → ImageOverlay
+    # --- Fallback: reproject → (optional) downsample → clean → stretch → colorize → ImageOverlay ---
     da = rxr.open_rasterio(tif_path, masked=True).squeeze()
     da_4326 = da.rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
 
     # Downsample for snappy UI
-    max_px = 1024
-    h = da_4326.sizes[da_4326.dims[0]]
-    w = da_4326.sizes[da_4326.dims[1]]
+    max_px = 1280  # you can bump to 1536/2048 if you want sharper overlays
+    h, w = da_4326.sizes[da_4326.dims[0]], da_4326.sizes[da_4326.dims[1]]
     scale = min(1.0, max_px / max(h, w))
     if scale < 1.0:
         resx, resy = da_4326.rio.resolution()
@@ -118,15 +135,12 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
         )
 
     arr = da_4326.values.astype("float32")
-
-    # Robust nodata/sentinel cleanup
     nd = da_4326.rio.nodata
     if nd is not None:
         arr = np.where(np.isclose(arr, nd, atol=1e-3), np.nan, arr)
     arr = np.where(arr <= -9_000, np.nan, arr)   # –9999 style
-    arr = np.where(arr <= -1e30, np.nan, arr)    # absurd negatives
-    arr = np.where(arr < 0, np.nan, arr)         # out-of-range low
-    arr = np.where(arr > 1e6, np.nan, arr)       # absurd highs
+    arr = np.where(arr < 0, np.nan, arr)
+    arr = np.where(arr > 1e6, np.nan, arr)
 
     finite = np.isfinite(arr)
     if finite.any():
@@ -143,14 +157,11 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
         st.caption("Infiltration display: no finite values; rendering blank.")
 
     rgba = (cm.get_cmap(palette_name)(np.clip(arr, 0, 1)) * 255).astype("uint8")
-    uri = _png_data_uri_from_rgba(rgba)
 
-    left, bottom, right, top = da_4326.rio.bounds()
-    bounds = [[bottom, left], [top, right]]
-
+    south, west, north, east = da_4326.rio.bounds()
     folium.raster_layers.ImageOverlay(
-        image=uri,              # data-URI PNG (robust across hosts)
-        bounds=bounds,
+        image=rgba,                 # pass ndarray directly (no caching issues)
+        bounds=[[south, west], [north, east]],
         name=name,
         opacity=float(opacity),
         interactive=False,
@@ -159,7 +170,17 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
     ).add_to(fm)
 
     # Keep map focused on the raster
-    fm.fit_bounds(bounds)
+    fm.fit_bounds([[south, west], [north, east]])
+
+import branca.colormap as bcm
+# Build a 0–1 legend (since we normalize in display)
+cmap = bcm.LinearColormap(
+    colors=[cm.get_cmap(palette)(x) for x in np.linspace(0, 1, 6)],
+    vmin=0, vmax=1
+).to_step(index=[0, 0.2, 0.4, 0.6, 0.8, 1])
+cmap.caption = "Infiltration (0 → 1)"
+cmap.add_to(fm)
+
 
 def sample_tiff_value(tif_path: str, lon: float, lat: float):
     try:
