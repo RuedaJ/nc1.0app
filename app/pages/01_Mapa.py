@@ -15,18 +15,12 @@ from rasterio.enums import Resampling
 from rasterio.windows import Window
 import rioxarray as rxr
 from pyproj import Transformer
+from shapely.geometry import Polygon
 
-# Map libs
+# Map libs (make streamlit-folium mandatory for better UX)
 import folium
 from streamlit_folium import st_folium
-
-# Color maps & legend
-from matplotlib import colormaps as mpl_cmaps
-import branca.colormap as bcm
-
-# For PNG data URI fallback
-from PIL import Image
-import io, base64
+import matplotlib.cm as cm
 
 from state import get_state
 
@@ -54,6 +48,7 @@ with st.sidebar:
                            help="How to normalize values for display.")
     show_aoi = st.checkbox("Show AOI", value=True)
     show_site = st.checkbox("Show site marker", value=True)
+    show_overlay_outline = st.checkbox("Debug: show overlay outline", value=False)
 
 # ---------- Helpers ----------
 def add_aoi_to_folium_map(fm: folium.Map, aoi_path: str):
@@ -66,6 +61,7 @@ def add_aoi_to_folium_map(fm: folium.Map, aoi_path: str):
                 {"color": "#0066CC", "weight": 2, "fill": False},
         )
         gj.add_to(fm)
+        # Fit to AOI bounds (raster fit happens first so AOI won't hide the overlay)
         minx, miny, maxx, maxy = gdf.to_crs(4326).total_bounds
         fm.fit_bounds([[miny, minx], [maxy, maxx]])
     except Exception as e:
@@ -81,55 +77,52 @@ def add_site_marker_to_folium_map(fm: folium.Map, lat: float, lon: float):
         popup="Site",
     ).add_to(fm)
 
-def _rgba_to_hex(rgba):
-    r, g, b, a = rgba
-    return "#{:02x}{:02x}{:02x}".format(int(r*255), int(g*255), int(b*255))
+def _percentile_stretch(arr: np.ndarray, finite: np.ndarray):
+    """Apply p2–p98 stretch."""
+    p2, p98 = np.nanpercentile(arr[finite], [2, 98])
+    return np.clip((arr - p2) / max(p98 - p2, 1e-6), 0, 1), p2, p98
 
-def _png_data_uri_from_rgba(rgba_uint8: np.ndarray) -> str:
-    """Encode RGBA uint8 image to data URI PNG so Folium always renders it."""
-    im = Image.fromarray(rgba_uint8, mode="RGBA")
-    buf = io.BytesIO()
-    im.save(buf, format="PNG")
-    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-    return f"data:image/png;base64,{b64}"
-
-def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
-                         opacity: float, palette_name: str, stretch_kind: str):
+def add_raster_to_folium(
+    fm: folium.Map,
+    tif_path: str,
+    name: str,
+    opacity: float,
+    palette_name: str,
+    stretch_kind: str,
+    show_outline: bool = False,
+):
     """
-    Preferred: localtileserver via leafmap.common.get_local_tile_layer
-    Fallback: reproject -> (optional) downsample -> normalize -> colorize -> PNG data URI ImageOverlay
+    Preferred: localtileserver (if installed) via leafmap.common.get_local_tile_layer
+    Fallback: reproject -> (optional downsample) -> normalize -> colorize -> ImageOverlay with live opacity
     """
     # Try local tiles first (if available)
     try:
         from leafmap.common import get_local_tile_layer
+        # NOTE: get_local_tile_layer() API varies; we accept a BoundTileLayer object and add it directly
+        tl = get_local_tile_layer(
+            tif_path, name=name, palette=palette_name, vmin=0, vmax=1, opacity=float(opacity)
+        )
+        # Some versions return a tuple, others a layer-like object — handle both:
+        if isinstance(tl, tuple):
+            layer = tl[0]
+        else:
+            layer = tl
         try:
-            out = get_local_tile_layer(
-                tif_path, layer_name=name, palette=palette_name, vmin=0, vmax=1, opacity=float(opacity)
-            )
-        except TypeError:
-            out = get_local_tile_layer(
-                tif_path, name=name, palette=palette_name, vmin=0, vmax=1, opacity=float(opacity)
-            )
-        # Handle both return types (BoundTileLayer vs tuple)
-        try:
-            tile_layer, _client = out
+            layer.add_to(fm)
         except Exception:
-            tile_layer = out
-        # Some BoundTileLayer objects don’t expose add_to; use add_child as a fallback
-        try:
-            tile_layer.add_to(fm)
-        except Exception:
-            fm.add_child(tile_layer)
+            # Some BoundTileLayer don’t have add_to, but can be added via fm.add_child
+            fm.add_child(layer)
+        folium.LayerControl(collapsed=False).add_to(fm)
         return
     except Exception as e:
         st.info(f"localtileserver not available ({e}). Using ImageOverlay fallback.")
 
-    # Fallback pipeline (serverless)
+    # Fallback pipeline
     da = rxr.open_rasterio(tif_path, masked=True).squeeze()
     da_4326 = da.rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
 
     # Downsample for snappy UI
-    max_px = 1280
+    max_px = 1024
     h = da_4326.sizes[da_4326.dims[0]]
     w = da_4326.sizes[da_4326.dims[1]]
     scale = min(1.0, max_px / max(h, w))
@@ -142,50 +135,58 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str,
         )
 
     arr = da_4326.values.astype("float32")
-    nd = da_4326.rio.nodata
-    if nd is not None:
-        arr = np.where(np.isclose(arr, nd, atol=1e-3), np.nan, arr)
-    arr = np.where(arr <= -9_000, np.nan, arr)   # –9999 style nodata
-    arr = np.where(arr < 0, np.nan, arr)
-    arr = np.where(arr > 1e6, np.nan, arr)
-
     finite = np.isfinite(arr)
     if finite.any():
         if stretch_kind == "p2–p98":
-            p2, p98 = np.nanpercentile(arr[finite], [2, 98])
+            arr, p2, p98 = _percentile_stretch(arr, finite)
             st.caption(f"Infiltration display: valid%={100*np.mean(finite):.1f} (p2={p2:.3f}, p98={p98:.3f})")
-            arr = np.clip((arr - p2) / max(p98 - p2, 1e-6), 0, 1)
         else:
             vmin, vmax = float(np.nanmin(arr[finite])), float(np.nanmax(arr[finite]))
-            st.caption(f"Infiltration display: valid%={100*np.mean(finite):.1f}, min={vmin:.4f}, max={vmax:.4f}")
             arr = (arr - vmin) / max(vmax - vmin, 1e-6)
+            st.caption(f"Infiltration display: valid%={100*np.mean(finite):.1f}, min={vmin:.4f}, max={vmax:.4f}")
     else:
-        st.caption("Infiltration display: no finite values; rendering blank.")
         arr = np.zeros_like(arr)
+        st.caption("Infiltration display: no finite values; rendering blank.")
 
-    cmap = mpl_cmaps.get_cmap(palette_name)
-    rgba = (cmap(np.clip(arr, 0, 1)) * 255).astype("uint8")
-    # Make NaNs fully transparent so basemap is visible
-    alpha = rgba[..., 3]
-    alpha[np.isnan(da_4326.values)] = 0
-    rgba[..., 3] = alpha
+    rgba = (cm.get_cmap(palette_name)(np.clip(arr, 0, 1)) * 255).astype("uint8")
 
-    # Convert to PNG data URI for compatibility
-    png_uri = _png_data_uri_from_rgba(rgba)
+    # --- CRITICAL FIX: correct bounds order & origin ---
+    # rioxarray bounds returns (left, bottom, right, top) = (west, south, east, north)
+    west, south, east, north = da_4326.rio.bounds()
 
-    south, west, north, east = da_4326.rio.bounds()
+    # Determine origin expected by Folium for the array orientation
+    # If latitude decreases from index 0 -> end, image origin is 'upper'; else 'lower'
+    try:
+        y0, yN = float(da_4326.y.values[0]), float(da_4326.y.values[-1])
+        origin = "upper" if y0 > yN else "lower"
+    except Exception:
+        origin = "upper"
+
     folium.raster_layers.ImageOverlay(
-        image=png_uri,                         # reliable data URI
-        bounds=[[south, west], [north, east]],
+        image=rgba,                              # pass RGBA ndarray
+        bounds=[[south, west], [north, east]],   # correct SW/NE order
         name=name,
-        opacity=float(opacity),                # live opacity
+        opacity=float(opacity),                  # bind slider value
+        origin=origin,                           # align image with coord orientation
         interactive=False,
         cross_origin=False,
-        zindex=1000,
+        zindex=500,
     ).add_to(fm)
+
+    # Optional: draw a thin outline to visually confirm the overlay extent
+    if show_outline:
+        outline = folium.PolyLine(
+            locations=[
+                [south, west], [south, east], [north, east], [north, west], [south, west]
+            ],
+            color="#7B68EE",
+            weight=2,
+        )
+        outline.add_to(fm)
 
     # Fit to the overlay bounds to ensure it's visible
     fm.fit_bounds([[south, west], [north, east]])
+    folium.LayerControl(collapsed=False).add_to(fm)
 
 def sample_tiff_value(tif_path: str, lon: float, lat: float):
     try:
@@ -241,15 +242,10 @@ def sample_slope_from_dem(dem_path: str, lon: float, lat: float):
 base_loc = (coords[0], coords[1]) if coords else (41.65, -0.89)
 fm = folium.Map(location=base_loc, zoom_start=12, control_scale=True, tiles="CartoDB positron")
 
-# Raster first (so we fit to it)
-add_raster_to_folium(fm, str(infil_path), "Infiltration", opacity, palette, stretch)
-
-# Legend (0–1 normalized)
-cmap_mpl = mpl_cmaps.get_cmap(palette)
-hex_colors = [_rgba_to_hex(cmap_mpl(x)) for x in np.linspace(0, 1, 6)]
-legend = bcm.LinearColormap(colors=hex_colors, vmin=0, vmax=1).to_step(index=[0, 0.2, 0.4, 0.6, 0.8, 1])
-legend.caption = "Infiltration (0 → 1)"
-legend.add_to(fm)
+# Raster first (so its fit_bounds wins)
+add_raster_to_folium(
+    fm, str(infil_path), "Infiltration", opacity, palette, stretch, show_outline=show_overlay_outline
+)
 
 # AOI & site
 if aoi_geojson and Path(aoi_geojson).exists() and show_aoi:
@@ -257,7 +253,7 @@ if aoi_geojson and Path(aoi_geojson).exists() and show_aoi:
 if show_site and coords:
     add_site_marker_to_folium_map(fm, coords[0], coords[1])
 
-# Render & click inspector
+# Render & click inspector with streamlit-folium
 st_data = st_folium(fm, height=640, use_container_width=True, returned_objects=["last_clicked"])
 last = st_data.get("last_clicked")
 with st.expander("Inspector", expanded=bool(last)):
