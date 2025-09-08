@@ -20,18 +20,17 @@ from pyproj import Transformer
 import folium
 from streamlit_folium import st_folium
 
-# Color maps (avoid old deprecations)
+# Modern colormap API
 try:
     from matplotlib import colormaps as _cmaps
     def _get_cmap(name: str):
         return _cmaps.get(name)
 except Exception:
-    import matplotlib.cm as _cmaps  # fallback
+    import matplotlib.cm as _cmaps
     def _get_cmap(name: str):
         return _cmaps.get_cmap(name)
 
 from branca.colormap import LinearColormap
-
 from state import get_state
 
 st.set_page_config(page_title="Mapa — sustai-geo-app", layout="wide")
@@ -70,8 +69,12 @@ def add_aoi_to_folium_map(fm: folium.Map, aoi_path: str):
                 {"color": "#0066CC", "weight": 2, "fill": False},
         )
         gj.add_to(fm)
-        # Keep last fit to the raster; so AOI fit happens only if raster is missing
-        if "Infiltration" not in [x.layer_name if hasattr(x, "layer_name") else getattr(x, "overlay", None) for x in fm._children.values()]:
+        # Fit to AOI only if we didn't already fit to the raster
+        try:
+            has_infil = any(getattr(ch, "layer_name", "") == "Infiltration" for ch in fm._children.values())
+        except Exception:
+            has_infil = False
+        if not has_infil:
             minx, miny, maxx, maxy = gdf.to_crs(4326).total_bounds
             fm.fit_bounds([[miny, minx], [maxy, maxx]])
     except Exception as e:
@@ -87,45 +90,59 @@ def add_site_marker_to_folium_map(fm: folium.Map, lat: float, lon: float):
         popup="Site",
     ).add_to(fm)
 
+# NEW: robust masking of nodata sentinels before stretching
+def _mask_sentinels(arr: np.ndarray, nodata):
+    a = arr.astype("float32", copy=True)
+    # If nodata specified, honor it
+    if nodata is not None and np.isfinite(nodata):
+        a[np.isclose(a, nodata, rtol=0, atol=1e-3)] = np.nan
+    # Common sentinels
+    sentinels = (-9999.0, -32768.0, 3.4028235e38, 1.0e20, -1.0e20)
+    for s in sentinels:
+        a[np.isclose(a, s, rtol=0, atol=max(1e-3, abs(s)*1e-6))] = np.nan
+    # If extreme negatives dominate, treat all < -1e3 as nodata
+    try:
+        q1 = np.nanpercentile(a, 1)
+        if np.isfinite(q1) and q1 < -1e3:
+            a[a < -1e3] = np.nan
+    except Exception:
+        pass
+    # drop infs
+    a[~np.isfinite(a)] = np.nan
+    return a
+
 def _normalize_for_display(arr: np.ndarray, kind: str):
     finite = np.isfinite(arr)
     if not finite.any():
         st.caption("Infiltration display: no finite values; rendering blank.")
-        return np.zeros_like(arr), 0.0, 0.0, 0.0
+        return np.zeros_like(arr), 0.0, 0.0, 0.0, finite
 
     if kind == "p2–p98":
         p2, p98 = np.nanpercentile(arr[finite], [2, 98])
         norm = np.clip((arr - p2) / max(p98 - p2, 1e-6), 0, 1)
         st.caption(f"Infiltration display: valid%={100*np.mean(finite):.1f} (p2={p2:.3f}, p98={p98:.3f})")
-        return norm, float(p2), float(p98), 100*np.mean(finite)
+        return norm, float(p2), float(p98), 100*np.mean(finite), finite
     else:
         vmin, vmax = float(np.nanmin(arr[finite])), float(np.nanmax(arr[finite]))
         norm = (arr - vmin) / max(vmax - vmin, 1e-6)
         st.caption(f"Infiltration display: valid%={100*np.mean(finite):.1f}, min={vmin:.4f}, max={vmax:.4f}")
-        return norm, vmin, vmax, 100*np.mean(finite)
+        return norm, vmin, vmax, 100*np.mean(finite), finite
 
 def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: float, palette_name: str, stretch_kind: str, show_outline: bool):
-    """
-    Preferred: localtileserver (if installed) via leafmap.common.get_local_tile_layer
-    Fallback: reproject -> (optional downsample) -> normalize -> colorize -> ImageOverlay with live opacity
-    """
-    # Try local tiles first (if available)
+    # Try fast tiles if available
     try:
         from leafmap.common import get_local_tile_layer
-        # Do NOT pass name= to avoid "multiple values" error; set name later if possible.
         tile = get_local_tile_layer(
             tif_path,
             palette=palette_name,
             vmin=0, vmax=1,
             opacity=float(opacity),
         )
+        # Add tile regardless of wrapper type
         try:
-            # Some objects are directly addable
             tile.add_to(fm)
         except Exception:
-            # Others require add_child
             fm.add_child(tile)
-        # Try to assign a friendly label for LayerControl
         try:
             setattr(tile, "layer_name", name)
         except Exception:
@@ -135,7 +152,7 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: floa
     except Exception as e:
         st.info(f"localtileserver not available ({e}). Using ImageOverlay fallback.")
 
-    # Fallback pipeline
+    # Fallback pipeline: reproject -> (downsample) -> mask nodata -> stretch -> colorize -> ImageOverlay
     da = rxr.open_rasterio(tif_path, masked=True).squeeze()
     da_4326 = da.rio.reproject("EPSG:4326", resampling=Resampling.bilinear)
 
@@ -152,31 +169,34 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: floa
             resampling=Resampling.bilinear,
         )
 
-    arr = da_4326.values.astype("float32")
-    norm, a, b, valid_pc = _normalize_for_display(arr, stretch_kind)
+    # Robust nodata masking
+    nodata_val = da_4326.rio.nodata
+    arr = _mask_sentinels(da_4326.values, nodata_val)
 
+    # Stretch for display
+    norm, a, b, valid_pc, finite = _normalize_for_display(arr, stretch_kind)
+
+    # Colorize + set alpha=0 on NaNs so holes are transparent
     cmap = _get_cmap(palette_name)
     rgba = (cmap(np.clip(norm, 0, 1)) * 255).astype("uint8")
+    alpha = (255 * float(opacity)) if 0.0 <= float(opacity) <= 1.0 else 255
+    rgba[..., 3] = int(alpha)
+    rgba[~finite, 3] = 0  # transparent on nodata
 
-    # Bounds come as (minx, miny, maxx, maxy) = (west, south, east, north)
     west, south, east, north = da_4326.rio.bounds()
-
-    # Set origin to match array orientation: if first row represents north -> origin='upper'
-    # In geographic coords increasing y is north; DataArray y usually decreases from top to bottom => origin='upper'
-    origin = "upper"
+    origin = "upper"  # rows go north->south
 
     folium.raster_layers.ImageOverlay(
-        image=rgba,                              # pass RGBA ndarray
+        image=rgba,
         bounds=[[south, west], [north, east]],
         name=name,
-        opacity=float(opacity),                  # bind slider value
+        opacity=1.0,  # already baked into alpha
         interactive=False,
         cross_origin=False,
         zindex=500,
         origin=origin,
     ).add_to(fm)
 
-    # Optional: draw outline box for debug
     if show_outline:
         folium.Rectangle(
             bounds=[[south, west], [north, east]],
@@ -187,11 +207,10 @@ def add_raster_to_folium(fm: folium.Map, tif_path: str, name: str, opacity: floa
             tooltip="Infiltration extent",
         ).add_to(fm)
 
-    # Fit to overlay bounds to ensure it's visible
     fm.fit_bounds([[south, west], [north, east]])
     folium.LayerControl(collapsed=False).add_to(fm)
 
-    # Optional legend
+    # Legend
     try:
         legend = LinearColormap(
             colors=[_get_cmap(palette_name)(x) for x in np.linspace(0, 1, 6)],
@@ -217,7 +236,6 @@ def sample_tiff_value(tif_path: str, lon: float, lat: float):
         return None
 
 def sample_slope_from_dem(dem_path: str, lon: float, lat: float):
-    """Approximate normalized slope [0,1] from a 3x3 window at click location."""
     try:
         if not dem_path or not Path(dem_path).exists():
             return None
@@ -265,7 +283,7 @@ if aoi_geojson and Path(aoi_geojson).exists() and show_aoi:
 if show_site and coords:
     add_site_marker_to_folium_map(fm, coords[0], coords[1])
 
-# Render & click inspector with streamlit-folium
+# Render & click inspector
 st_data = st_folium(fm, height=640, use_container_width=True, returned_objects=["last_clicked"])
 last = st_data.get("last_clicked")
 with st.expander("Inspector", expanded=bool(last)):
