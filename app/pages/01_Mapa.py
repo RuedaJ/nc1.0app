@@ -4,7 +4,15 @@ Includes a click-inspector that samples multiple rasters.
 """
 
 from __future__ import annotations
+# === PATH BOOTSTRAP (fix ModuleNotFoundError: 'app', 'etl') ===
+import sys
 from pathlib import Path
+_THIS = Path(__file__).resolve()
+_REPO_ROOT = _THIS.parents[2]  # project root (../../ from app/pages/)
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+# =============================================================
+
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
@@ -14,11 +22,6 @@ from etl.io import read_vector
 from etl import hydrology as hydro
 
 
-def repo_root_from_file(__file__: str) -> Path:
-    return Path(__file__).resolve().parents[2]
-
-
-_REPO_ROOT = repo_root_from_file(__file__)
 DATA_DIR = _REPO_ROOT / "data"
 PROC_DIR = DATA_DIR / "processed"
 HYDRO_DIR = PROC_DIR / "hydrology"
@@ -27,11 +30,9 @@ AOI_DIR = PROC_DIR / "aoi"
 st.set_page_config(page_title="Mapa", layout="wide")
 st.title("🗺️ Mapa")
 
-
 # ---------------------------
 # State & inputs
 # ---------------------------
-
 state = st.session_state
 lat = state.get("lat", 40.4168)
 lon = state.get("lon", -3.7038)
@@ -42,14 +43,11 @@ paths = state.get("paths", {
     "slope": str(HYDRO_DIR / "Slope_deg.tif"),
     "infiltration": str(HYDRO_DIR / "InfiltrationScore.tif"),
 })
-# Persist back to session
-state["paths"] = paths
-
+state["paths"] = paths  # persist
 
 # ---------------------------
 # Build map
 # ---------------------------
-
 m = folium.Map(location=[lat, lon], zoom_start=12, tiles=None)
 folium.TileLayer("CartoDB positron", name="Base").add_to(m)
 
@@ -62,7 +60,7 @@ if infil_tif.exists():
     except Exception as e:
         st.warning(f"No se pudo usar tiles locales: {e}")
 
-# AOI overlay (if present). Expect a GeoPackage: data/processed/aoi/aoi.gpkg
+# AOI overlay (GeoPackage: data/processed/aoi/aoi.gpkg)
 aoi_gpkg = AOI_DIR / "aoi.gpkg"
 if aoi_gpkg.exists():
     try:
@@ -75,7 +73,6 @@ if aoi_gpkg.exists():
 
 folium.LayerControl().add_to(m)
 
-# Render map and capture interactions
 st.write("Haz clic en el mapa para inspeccionar valores.")
 event = st_folium(m, width=None, height=700, returned_objects=["last_clicked"])
 
